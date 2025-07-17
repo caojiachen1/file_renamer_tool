@@ -82,22 +82,3 @@ file_renamer_cli.exe C:\MyFiles -e -x jpg
 The tool processes files as follows:
 1. Original: `document.pdf`
 2. Renamed: `d41d8cd98f00b204e9800998ecf8427e.pdf` (MD5 hash + original extension)
-
-## Build Details
-
-- **Compiler**: MSVC v143 (Visual Studio 2022)
-- **Standard**: C++17
-- **Architecture**: x64
-- **Dependencies**: Windows CryptoAPI (advapi32.lib)
-
-## Project Structure
-
-```
-FileRenamerTool/
-├── file_renamer_cli.cpp    # Main CLI application
-├── CMakeLists.txt          # CMake configuration
-├── build.bat              # Build script
-├── quick_build.bat        # Quick build script
-├── demo_en.bat            # Demo script
-└── README.md              # This file
-```
