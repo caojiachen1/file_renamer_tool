@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(FileRenamerTool VERSION 2.0.0 LANGUAGES CXX)
+project(FileRenamerTool VERSION 1.0.0 LANGUAGES CXX)
 
 # 要求使用Visual Studio 2022 (MSVC v143)
 if(NOT MSVC OR MSVC_VERSION LESS 1930)
