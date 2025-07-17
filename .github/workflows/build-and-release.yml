@@ -1,0 +1,412 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 触发条件：推送形如 v1.0.0 的标签
+    branches:
+      - main
+      - master  # 支持通过commit信息自动触发release
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      version_type:
+        description: '版本更新类型'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      custom_version:
+        description: '自定义版本号 (例如: v2.0.1, 留空则自动递增)'
+        required: false
+        default: ''
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+      
+    - name: Setup CMake
+      uses: lukka/get-cmake@latest
+      
+    - name: Get version from tag or input
+      id: version
+      shell: pwsh
+      run: |
+        if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+          # 手动触发的情况
+          $custom_version = "${{ github.event.inputs.custom_version }}"
+          
+          if ($custom_version -and $custom_version.Trim() -ne "") {
+            # 使用自定义版本号
+            $version = $custom_version.Trim()
+            Write-Host "使用自定义版本号: $version"
+          } else {
+            # 自动递增版本号
+            $version_type = "${{ github.event.inputs.version_type }}"
+            Write-Host "版本更新类型: $version_type"
+            
+            # 使用GitHub API获取最新的release
+            try {
+              $headers = @{
+                'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+                'Accept' = 'application/vnd.github.v3+json'
+              }
+              
+              $response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/latest" -Headers $headers -ErrorAction SilentlyContinue
+              
+              if ($response -and $response.tag_name) {
+                $latest_tag = $response.tag_name
+                Write-Host "通过API找到最新release标签: $latest_tag"
+              } else {
+                # 如果没有release，尝试获取最新的tag
+                $tags_response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/tags" -Headers $headers -ErrorAction SilentlyContinue
+                if ($tags_response -and $tags_response.Length -gt 0) {
+                  $latest_tag = $tags_response[0].name
+                  Write-Host "通过API找到最新标签: $latest_tag"
+                } else {
+                  $latest_tag = "v2.0.0"
+                  Write-Host "未找到任何标签，使用默认版本: $latest_tag"
+                }
+              }
+            } catch {
+              # 回退到git命令
+              Write-Host "API调用失败，回退到git命令"
+              $latest_tag = git describe --tags --abbrev=0 2>$null
+              if (-not $latest_tag) {
+                $latest_tag = "v2.0.0"
+                Write-Host "未找到现有标签，使用默认版本: $latest_tag"
+              } else {
+                Write-Host "通过git找到最新标签: $latest_tag"
+              }
+            }
+            
+            # 解析版本号
+            if ($latest_tag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+              $major = [int]$matches[1]
+              $minor = [int]$matches[2]
+              $patch = [int]$matches[3]
+              
+              # 根据类型递增版本号
+              switch ($version_type) {
+                "major" { 
+                  $major++
+                  $minor = 0
+                  $patch = 0
+                }
+                "minor" { 
+                  $minor++
+                  $patch = 0
+                }
+                "patch" { 
+                  $patch++
+                }
+              }
+              
+              $version = "v$major.$minor.$patch"
+              Write-Host "自动递增后的版本: $version"
+            } else {
+              Write-Error "无法解析版本号格式: $latest_tag"
+              exit 1
+            }
+          }
+        } else {
+          # 推送触发的情况 (标签推送或分支推送)
+          if ("${{ github.ref_type }}" -eq "tag") {
+            # 标签推送触发
+            $version = "${{ github.ref_name }}"
+            Write-Host "从标签获取版本: $version"
+          } else {
+            # 分支推送触发 - 检查commit信息来确定是否需要自动发布
+            $commit_message = git log -1 --pretty=format:"%s%n%b"
+            Write-Host "检查commit信息: $commit_message"
+            
+            # 检查commit信息中的版本控制关键词
+            $auto_version_type = $null
+            
+            # 优先检查末尾的[]标记
+            if ($commit_message -match '\[major\]$') {
+              $auto_version_type = "major"
+            } elseif ($commit_message -match '\[minor\]$') {
+              $auto_version_type = "minor"
+            } elseif ($commit_message -match '\[patch\]$') {
+              $auto_version_type = "patch"
+            }
+            # 如果没有[]标记，再检查其他关键词
+            elseif ($commit_message -match '\bmajor:|\bbreaking\s*change|\bBREAKING\s*CHANGE') {
+              $auto_version_type = "major"
+            } elseif ($commit_message -match '\bminor:|\bfeat:|\bfeature:') {
+              $auto_version_type = "minor"
+            } elseif ($commit_message -match '\bpatch:|\bfix:|\bbugfix:') {
+              $auto_version_type = "patch"
+            }
+            
+            if (-not $auto_version_type) {
+              Write-Host "commit信息中未找到版本控制关键词，跳过自动发布"
+              Write-Host "支持的标记格式:"
+              Write-Host "  - 消息末尾: [major], [minor], [patch]"
+              Write-Host "  - 前缀关键词: major:, minor:, patch:, feat:, fix:, etc."
+              Write-Host "当前commit: $commit_message"
+              exit 0
+            }
+            
+            Write-Host "从commit信息检测到版本类型: $auto_version_type"
+            
+            # 使用GitHub API获取最新的release来自动计算版本
+            try {
+              $headers = @{
+                'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+                'Accept' = 'application/vnd.github.v3+json'
+              }
+              
+              $response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/latest" -Headers $headers -ErrorAction SilentlyContinue
+              
+              if ($response -and $response.tag_name) {
+                $latest_tag = $response.tag_name
+                Write-Host "通过API找到最新release标签: $latest_tag"
+              } else {
+                # 如果没有release，尝试获取最新的tag
+                $tags_response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/tags" -Headers $headers -ErrorAction SilentlyContinue
+                if ($tags_response -and $tags_response.Length -gt 0) {
+                  $latest_tag = $tags_response[0].name
+                  Write-Host "通过API找到最新标签: $latest_tag"
+                } else {
+                  $latest_tag = "v2.0.0"
+                  Write-Host "未找到任何标签，使用默认版本: $latest_tag"
+                }
+              }
+              
+              # 解析并递增版本号
+              if ($latest_tag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+                $major = [int]$matches[1]
+                $minor = [int]$matches[2]
+                $patch = [int]$matches[3]
+                
+                switch ($auto_version_type) {
+                  "major" { 
+                    $major++
+                    $minor = 0
+                    $patch = 0
+                  }
+                  "minor" { 
+                    $minor++
+                    $patch = 0
+                  }
+                  "patch" { 
+                    $patch++
+                  }
+                }
+                
+                $version = "v$major.$minor.$patch"
+                Write-Host "基于commit信息自动递增版本: $latest_tag → $version"
+              } else {
+                Write-Error "无法解析版本号格式: $latest_tag"
+                exit 1
+              }
+            } catch {
+              Write-Error "API调用失败，无法自动生成版本"
+              exit 1
+            }
+          }
+        }
+        
+        # 确保版本格式正确 (v主版本.次版本.修订版本)
+        if ($version -notmatch '^v\d+\.\d+\.\d+$') {
+          Write-Error "版本格式错误。请使用 v主版本.次版本.修订版本 格式 (例如: v2.0.1)"
+          Write-Error "当前版本: $version"
+          exit 1
+        }
+        
+        Write-Output "version=$version" >> $env:GITHUB_OUTPUT
+        Write-Output "version_number=$($version.Substring(1))" >> $env:GITHUB_OUTPUT
+        Write-Host "最终版本: $version"
+        
+    - name: Update version in CMakeLists.txt
+      shell: pwsh
+      run: |
+        $version_number = "${{ steps.version.outputs.version_number }}"
+        $cmake_content = Get-Content CMakeLists.txt -Raw
+        $cmake_content = $cmake_content -replace 'project\(FileRenamerTool VERSION \d+\.\d+\.\d+', "project(FileRenamerTool VERSION $version_number"
+        Set-Content CMakeLists.txt $cmake_content
+        Write-Host "已更新 CMakeLists.txt 中的版本号为: $version_number"
+        
+    - name: Create and push tag (for manual trigger and auto release)
+      if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'branch')
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        
+        # 检查标签是否已存在
+        $existing_tag = git tag -l $version
+        if ($existing_tag) {
+          Write-Host "标签 $version 已存在，跳过创建"
+        } else {
+          Write-Host "创建新标签: $version"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag $version
+          git push origin $version
+          Write-Host "标签 $version 已创建并推送"
+        }
+        
+    - name: Build project
+      shell: cmd
+      run: |
+        echo 开始构建项目...
+        call build.bat
+        if %errorlevel% neq 0 (
+          echo 构建失败！
+          exit /b %errorlevel%
+        )
+        echo 构建完成！
+        
+    - name: Verify build artifacts
+      shell: pwsh
+      run: |
+        Write-Host "检查构建产物..."
+        
+        $release_exe = "build\Release\file_renamer_cli.exe"
+        $debug_exe = "build\Debug\file_renamer_cli_d.exe"
+        $root_exe = "file_renamer_cli.exe"
+        
+        if (Test-Path $release_exe) {
+          Write-Host "✓ 找到 Release 版本: $release_exe"
+          $size = (Get-Item $release_exe).Length
+          Write-Host "  文件大小: $([math]::Round($size/1KB, 2)) KB"
+        } else {
+          Write-Error "✗ 未找到 Release 版本: $release_exe"
+          exit 1
+        }
+        
+        if (Test-Path $debug_exe) {
+          Write-Host "✓ 找到 Debug 版本: $debug_exe"
+        } else {
+          Write-Host "⚠ 未找到 Debug 版本: $debug_exe"
+        }
+        
+        if (Test-Path $root_exe) {
+          Write-Host "✓ 找到根目录副本: $root_exe"
+        } else {
+          Write-Host "⚠ 未找到根目录副本: $root_exe"
+        }
+        
+    - name: Prepare release assets
+      shell: pwsh
+      run: |
+        Write-Host "准备发布文件..."
+        
+        # 创建发布目录
+        New-Item -ItemType Directory -Force -Path "release-assets"
+        
+        # 复制主要可执行文件
+        $version = "${{ steps.version.outputs.version }}"
+        $release_name = "file_renamer_cli_$($version)_windows_x64.exe"
+        Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
+        
+        Write-Host "发布文件准备完成："
+        Get-ChildItem "release-assets" | ForEach-Object {
+          Write-Host "  - $($_.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
+        }
+        
+    - name: Create release notes
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        
+        # 获取最新的commit信息
+        $commit_message = git log -1 --pretty=format:"%s"
+        $commit_body = git log -1 --pretty=format:"%b"
+        $commit_hash = git log -1 --pretty=format:"%h"
+        
+        # 创建简洁的发布说明
+        $content = @()
+        $content += "## 📦 File Renamer CLI Tool $version"
+        $content += ""
+        
+        # 添加commit信息
+        if ($commit_message) {
+          $content += "### 🔄 更新内容"
+          $content += "- $commit_message"
+          if ($commit_body -and $commit_body.Trim() -ne "") {
+            $commit_body.Split("`n") | ForEach-Object {
+              if ($_.Trim() -ne "") {
+                $content += "- $($_.Trim())"
+              }
+            }
+          }
+          $content += ""
+          $content += "*Commit: $commit_hash*"
+          $content += ""
+        }
+        
+        # 添加使用说明
+        $content += "### 🚀 使用方法"
+        $content += ""
+        $content += "**预览模式（推荐先试用）：**"
+        $content += '```cmd'
+        $content += 'file_renamer_cli.exe "C:\MyFiles" -x jpg,png'
+        $content += '```'
+        $content += ""
+        $content += "**执行重命名：**"
+        $content += '```cmd'
+        $content += 'file_renamer_cli.exe "C:\MyFiles" -x jpg,png -e'
+        $content += '```'
+        $content += ""
+        $content += "**更多选项：**"
+        $content += '```cmd'
+        $content += 'file_renamer_cli.exe --help'
+        $content += '```'
+        $content += ""
+        $content += "### � 系统要求"
+        $content += "- Windows 10/11 (x64)"
+        $content += "- 无需额外依赖"
+        
+        $content | Out-File "release-notes.md" -Encoding UTF8
+        Write-Host "发布说明已生成"
+        
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.version.outputs.version }}
+        release_name: File Renamer CLI Tool ${{ steps.version.outputs.version }}
+        body_path: release-notes.md
+        draft: false
+        prerelease: false
+        
+    - name: Upload Release Asset - Main Executable
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: release-assets/file_renamer_cli_${{ steps.version.outputs.version }}_windows_x64.exe
+        asset_name: file_renamer_cli_${{ steps.version.outputs.version }}_windows_x64.exe
+        asset_content_type: application/octet-stream
+
+    - name: Build Summary
+      shell: pwsh
+      run: |
+        Write-Host "🎉 构建和发布完成！"
+        Write-Host ""
+        Write-Host "📋 构建摘要:"
+        Write-Host "  版本: ${{ steps.version.outputs.version }}"
+        Write-Host "  发布URL: ${{ steps.create_release.outputs.html_url }}"
+        Write-Host ""
+        Write-Host "📦 发布的文件:"
+        Get-ChildItem "release-assets" | ForEach-Object {
+          Write-Host "  ✓ $($_.Name)"
+        }
+        Write-Host ""
+        Write-Host "🔗 下载链接:"
+        Write-Host "  Release页面: ${{ steps.create_release.outputs.html_url }}"

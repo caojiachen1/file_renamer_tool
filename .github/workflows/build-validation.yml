@@ -1,0 +1,60 @@
+name: Build Validation
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+    paths-ignore:
+      - '*.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+      
+    - name: Setup CMake
+      uses: lukka/get-cmake@latest
+      
+    - name: Build project
+      shell: cmd
+      run: |
+        echo "开始构建验证..."
+        call build.bat
+        if %errorlevel% neq 0 (
+          echo "构建失败！"
+          exit /b %errorlevel%
+        )
+        echo "构建验证通过！"
+        
+    - name: Test executable
+      shell: pwsh
+      run: |
+        Write-Host "测试可执行文件..."
+        
+        $exe_path = "build\Release\file_renamer_cli.exe"
+        if (Test-Path $exe_path) {
+          Write-Host "✓ 找到 Release 版本: $exe_path"
+          
+          # 测试帮助命令
+          & $exe_path --help
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "✓ 帮助命令测试通过"
+          } else {
+            Write-Host "✗ 帮助命令测试失败"
+            exit 1
+          }
+        } else {
+          Write-Host "✗ 未找到可执行文件: $exe_path"
+          exit 1
+        }
+        
+        Write-Host "✓ 所有测试通过！"
