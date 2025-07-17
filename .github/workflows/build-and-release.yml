@@ -333,7 +333,6 @@ jobs:
         
         # 添加commit信息
         if ($commit_message) {
-          $content += "### 🔄 更新内容"
           $content += "- $commit_message"
           if ($commit_body -and $commit_body.Trim() -ne "") {
             $commit_body.Split("`n") | ForEach-Object {
@@ -348,9 +347,9 @@ jobs:
         }
         
         # 添加使用说明
-        $content += "### 🚀 使用方法"
+        $content += "使用方法"
         $content += ""
-        $content += "**预览模式（推荐先试用）：**"
+        $content += "**预览模式**"
         $content += '```cmd'
         $content += 'file_renamer_cli.exe "C:\MyFiles" -x jpg,png'
         $content += '```'
@@ -365,9 +364,8 @@ jobs:
         $content += 'file_renamer_cli.exe --help'
         $content += '```'
         $content += ""
-        $content += "### � 系统要求"
+        $content += "系统要求"
         $content += "- Windows 10/11 (x64)"
-        $content += "- 无需额外依赖"
         
         $content | Out-File "release-notes.md" -Encoding UTF8
         Write-Host "发布说明已生成"
