@@ -38,7 +38,7 @@ jobs:
       uses: lukka/get-cmake@latest
       
     - name: Setup CUDA 12.8
-      uses: Jimver/cuda-toolkit@v0.2.16
+      uses: Jimver/cuda-toolkit@v0.2.26
       with:
         cuda: '12.8.0'
         method: 'network'
