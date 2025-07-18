@@ -261,20 +261,38 @@ jobs:
       shell: cmd
       run: |
         echo 开始构建项目...
-        call build.bat
+        
+        echo 配置CMake...
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        if %errorlevel% neq 0 (
+          echo CMake配置失败！
+          exit /b %errorlevel%
+        )
+        
+        echo 编译项目...
+        cmake --build build --config Release
         if %errorlevel% neq 0 (
           echo 构建失败！
           exit /b %errorlevel%
         )
-        echo 构建完成！
+        
+        echo 复制可执行文件到根目录...
+        copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
+        if exist "build\Release\file_renamer_cli.exe" (
+          echo ✓ 构建完成！
+        ) else (
+          echo ✗ 未找到构建产物！
+          exit /b 1
+        )
         
     - name: Verify build artifacts
       shell: pwsh
       run: |
         Write-Host "检查构建产物..."
         
-        $release_exe = "build\Release\file_renamer.exe"
+        $release_exe = "build\Release\file_renamer_cli.exe"
         $root_exe = "file_renamer.exe"
+        $debug_exe = "build\Debug\file_renamer_cli.exe"
         
         if (Test-Path $release_exe) {
           Write-Host "✓ 找到 Release 版本: $release_exe"
@@ -308,7 +326,7 @@ jobs:
         # 复制主要可执行文件
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "file_renamer_cli_$($version)_windows_x64.exe"
-        Copy-Item "build\Release\file_renamer.exe" "release-assets\$release_name"
+        Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
         
         Write-Host "发布文件准备完成："
         Get-ChildItem "release-assets" | ForEach-Object {
