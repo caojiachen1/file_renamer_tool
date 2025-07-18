@@ -140,7 +140,7 @@ public:
         
         // For very large files, consider memory limitations
         if (fileSize > 100 * 1024 * 1024) { // 100MB threshold
-            std::cerr << "Warning: Large file detected (" << fileSize / (1024*1024) << "MB): " << filePath << std::endl;
+            std::cerr << "Warning: Large file detected (" << fileSize / (1024*1024) << "MB): " << filePath.u8string() << std::endl;
         }
         
         std::vector<BYTE> data;
@@ -152,7 +152,7 @@ public:
     
     // Memory-mapped file hash calculation for very large files
     static std::string CalculateFileHashMemoryMapped(const fs::path& filePath, const std::string& algorithm = "MD5") {
-        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        HANDLE hFile = CreateFileW(filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) {
             return "";
         }
@@ -402,7 +402,7 @@ public:
     static bool RenameFile(const fs::path& oldPath, const fs::path& newPath) {
         try {
             if (fs::exists(newPath)) {
-                std::cout << "Warning: Target file already exists: " << newPath << std::endl;
+                std::cout << "Warning: Target file already exists: " << newPath.u8string() << std::endl;
                 return false;
             }
             
@@ -726,6 +726,10 @@ std::vector<std::string> ParseExtensions(const std::string& extensionsStr) {
 }
 
 int main(int argc, char* argv[]) {
+    // Set console code page to UTF-8 for proper Unicode display
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    
     if (argc < 2) {
         PrintUsage();
         return 1;
