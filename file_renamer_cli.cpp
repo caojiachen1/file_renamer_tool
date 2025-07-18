@@ -1557,6 +1557,7 @@ void PrintUsage() {
     std::cout << "                          (e.g., jpg,png,txt or .jpg,.png,.txt)" << std::endl;
     std::cout << "  -q, --quick             Enable quick check for already-named files [default: on]" << std::endl;
     std::cout << "  --no-quick              Disable quick check (force full hash calculation)" << std::endl;
+    std::cout << "  -y, --yes               Auto-confirm without user interaction" << std::endl;
     std::cout << "  -t, --threads <n>       Number of processing threads [default: auto-detect]" << std::endl;
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
     std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
@@ -1580,6 +1581,7 @@ void PrintUsage() {
     std::cout << "  file_renamer C:\\MyFiles --single-thread               # Original single-threaded mode" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -e -t 16           # Execute SHA1 renaming with 16 threads, recursive" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles --no-quick -t 4               # Force full hash check with 4 threads" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -e -y                        # Execute renaming with auto-confirm" << std::endl;
 }
 
 std::vector<std::string> ParseExtensions(const std::string& extensionsStr) {
@@ -1616,6 +1618,7 @@ int main(int argc, char* argv[]) {
     bool dryRun = true;
     bool showHelp = false;
     bool quickCheck = true; // Enable quick check by default
+    bool autoConfirm = false; // Auto-confirm without user interaction
     int numThreads = 0; // Auto-detect by default
     size_t batchSize = 0; // Auto-calculate by default
     enum ProcessingMode { ULTRA_FAST, MULTI_THREAD, BATCH_MODE, SINGLE_THREAD };
@@ -1637,6 +1640,8 @@ int main(int argc, char* argv[]) {
             quickCheck = true;
         } else if (arg == "--no-quick") {
             quickCheck = false;
+        } else if (arg == "-y" || arg == "--yes") {
+            autoConfirm = true;
         } else if (arg == "--ultra-fast") {
             mode = ULTRA_FAST;
         } else if (arg == "--single-thread") {
@@ -1693,14 +1698,19 @@ int main(int argc, char* argv[]) {
     
     if (!dryRun) {
         std::cout << "WARNING: This will permanently rename files!" << std::endl;
-        std::cout << "Are you sure you want to continue? (y/N): ";
         
-        std::string confirm;
-        std::getline(std::cin, confirm);
-        
-        if (confirm != "y" && confirm != "Y" && confirm != "yes" && confirm != "Yes") {
-            std::cout << "Operation cancelled." << std::endl;
-            return 0;
+        if (autoConfirm) {
+            std::cout << "Auto-confirm is enabled. Proceeding with renaming..." << std::endl;
+        } else {
+            std::cout << "Are you sure you want to continue? (y/N): ";
+            
+            std::string confirm;
+            std::getline(std::cin, confirm);
+            
+            if (confirm != "y" && confirm != "Y" && confirm != "yes" && confirm != "Yes") {
+                std::cout << "Operation cancelled." << std::endl;
+                return 0;
+            }
         }
     }
     
