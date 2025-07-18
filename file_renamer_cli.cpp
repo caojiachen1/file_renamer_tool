@@ -177,13 +177,26 @@ public:
         
         // If specifically requesting CPU
         if (deviceId == -1) {
-            useGPU = false;
-            selectedDevice = -1;
-            std::cout << "Using CPU processing (Device -1)" << std::endl;
+            ForceCPUMode();
             return false; // Return false for GPU, but this is expected for CPU
         }
         
 #ifdef USE_CUDA
+        // Lightweight CUDA availability check first
+        int deviceCount = 0;
+        cudaError_t cudaError = cudaGetDeviceCount(&deviceCount);
+        
+        if (cudaError != cudaSuccess || deviceCount == 0) {
+            if (deviceId >= 0) {
+                std::cout << "CUDA not available (" << cudaGetErrorString(cudaError) 
+                          << "), cannot use GPU device " << deviceId << std::endl;
+            }
+            std::cout << "Using CPU processing (CUDA not available)" << std::endl;
+            useGPU = false;
+            selectedDevice = -1;
+            return false;
+        }
+        
         if (CudaHashCalculator::Initialize()) {
             // If deviceId is specified and >= 0, try to select that device
             if (deviceId >= 0) {
@@ -241,6 +254,17 @@ public:
         return false;
     }
     
+    // Force CPU-only mode and cleanup any GPU resources
+    static void ForceCPUMode() {
+        if (gpuInitialized) {
+            CleanupGPU();
+        }
+        useGPU = false;
+        selectedDevice = -1;
+        gpuInitialized = true; // Mark as initialized but in CPU mode
+        std::cout << "Forced CPU-only mode enabled" << std::endl;
+    }
+    
     // Get current selected device
     static int GetSelectedDevice() {
         return selectedDevice;
@@ -250,37 +274,124 @@ public:
     static void ListAvailableDevices() {
         std::cout << "Available computing devices:" << std::endl;
         
-        // Always show CPU as device -1
-        std::cout << "  Device -1: CPU (Multi-threaded)" << std::endl;
-        std::cout << "    Type: CPU" << std::endl;
-        std::cout << "    Threads: " << std::thread::hardware_concurrency() << std::endl;
-        std::cout << "    Status: Always available" << std::endl;
+        // Show detailed CPU information as device -1
+        // Get CPU name from registry
+        std::string cpuName = "Unknown CPU";
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            char processorName[256];
+            DWORD bufferSize = sizeof(processorName);
+            if (RegQueryValueExA(hKey, "ProcessorNameString", NULL, NULL, (LPBYTE)processorName, &bufferSize) == ERROR_SUCCESS) {
+                cpuName = std::string(processorName);
+                // Trim whitespace
+                cpuName.erase(0, cpuName.find_first_not_of(" \t\r\n"));
+                cpuName.erase(cpuName.find_last_not_of(" \t\r\n") + 1);
+            }
+            RegCloseKey(hKey);
+        }
+        
+        std::cout << "  Device -1: " << cpuName << std::endl;
+        std::cout << "    Type: CPU (Multi-threaded)" << std::endl;
+        std::cout << "    Logical Cores: " << std::thread::hardware_concurrency() << std::endl;
+        
+        // Get additional CPU information from Windows
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        std::cout << "    Physical Processors: " << sysInfo.dwNumberOfProcessors << std::endl;
+        std::cout << "    Processor Architecture: ";
+        switch (sysInfo.wProcessorArchitecture) {
+            case PROCESSOR_ARCHITECTURE_AMD64:
+                std::cout << "x64 (AMD64)";
+                break;
+            case PROCESSOR_ARCHITECTURE_ARM:
+                std::cout << "ARM";
+                break;
+            case PROCESSOR_ARCHITECTURE_ARM64:
+                std::cout << "ARM64";
+                break;
+            case PROCESSOR_ARCHITECTURE_INTEL:
+                std::cout << "x86 (Intel)";
+                break;
+            default:
+                std::cout << "Unknown (" << sysInfo.wProcessorArchitecture << ")";
+                break;
+        }
+        std::cout << std::endl;
+        
+        // Get memory information
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        if (GlobalMemoryStatusEx(&memInfo)) {
+            std::cout << "    Total RAM: " << (memInfo.ullTotalPhys / (1024*1024)) << " MB" << std::endl;
+            std::cout << "    Available RAM: " << (memInfo.ullAvailPhys / (1024*1024)) << " MB" << std::endl;
+            std::cout << "    Memory Usage: " << (100 - (memInfo.ullAvailPhys * 100 / memInfo.ullTotalPhys)) << "%" << std::endl;
+        }
+        
+        if (selectedDevice == -1) {
+            std::cout << "    Status: Currently selected" << std::endl;
+        } else {
+            std::cout << "    Status: Always available" << std::endl;
+        }
         std::cout << std::endl;
         
 #ifdef USE_CUDA
-        if (!gpuInitialized) {
-            // Temporarily initialize to get device info
-            CudaHashCalculator::Initialize();
-        }
+        // Don't force initialize CUDA just to list devices
+        // Only check if CUDA is available but don't initialize full context
+        int deviceCount = 0;
+        cudaError_t error = cudaGetDeviceCount(&deviceCount);
+        bool cudaAvailable = (error == cudaSuccess && deviceCount > 0);
         
-        const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
-        
-        if (gpuInfo.deviceCount == 0) {
-            std::cout << "No CUDA-capable GPU devices found." << std::endl;
-        } else {
-            for (int i = 0; i < gpuInfo.deviceCount; i++) {
-                const auto& device = gpuInfo.devices[i];
-                std::cout << "  Device " << i << ": " << device.name << std::endl;
-                std::cout << "    Type: GPU (CUDA)" << std::endl;
-                std::cout << "    Compute Capability: " << device.major << "." << device.minor << std::endl;
-                std::cout << "    Global Memory: " << (device.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
-                std::cout << "    Multiprocessors: " << device.multiProcessorCount << std::endl;
-                std::cout << "    Max Threads per Block: " << device.maxThreadsPerBlock << std::endl;
-                if (selectedDevice == i && useGPU) {
-                    std::cout << "    Status: Currently selected" << std::endl;
+        if (cudaAvailable) {
+            if (gpuInitialized) {
+                // If GPU is already initialized, show full info
+                const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
+                
+                if (gpuInfo.deviceCount == 0) {
+                    std::cout << "No CUDA-capable GPU devices found." << std::endl;
+                } else {
+                    for (int i = 0; i < gpuInfo.deviceCount; i++) {
+                        const auto& device = gpuInfo.devices[i];
+                        std::cout << "  Device " << i << ": " << device.name << std::endl;
+                        std::cout << "    Type: GPU (CUDA)" << std::endl;
+                        std::cout << "    Compute Capability: " << device.major << "." << device.minor << std::endl;
+                        std::cout << "    Global Memory: " << (device.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
+                        std::cout << "    Multiprocessors: " << device.multiProcessorCount << std::endl;
+                        std::cout << "    Max Threads per Block: " << device.maxThreadsPerBlock << std::endl;
+                        if (selectedDevice == i && useGPU) {
+                            std::cout << "    Status: Currently selected" << std::endl;
+                        }
+                        std::cout << std::endl;
+                    }
                 }
-                std::cout << std::endl;
+            } else {
+                // Show basic GPU info without full initialization
+                std::cout << "CUDA-capable GPU devices detected: " << deviceCount << " device(s)" << std::endl;
+                
+                // Get basic device properties without initializing CUDA context
+                for (int i = 0; i < deviceCount; i++) {
+                    cudaDeviceProp prop;
+                    cudaError_t error = cudaGetDeviceProperties(&prop, i);
+                    
+                    if (error == cudaSuccess) {
+                        std::cout << "  Device " << i << ": " << prop.name << std::endl;
+                        std::cout << "    Type: GPU (CUDA)" << std::endl;
+                        std::cout << "    Compute Capability: " << prop.major << "." << prop.minor << std::endl;
+                        std::cout << "    Global Memory: " << (prop.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
+                        std::cout << "    Multiprocessors: " << prop.multiProcessorCount << std::endl;
+                        std::cout << "    Max Threads per Block: " << prop.maxThreadsPerBlock << std::endl;
+                        std::cout << "    Status: Available (not initialized)" << std::endl;
+                        std::cout << std::endl;
+                    } else {
+                        std::cout << "  Device " << i << ": <Error getting properties>" << std::endl;
+                        std::cout << "    Error: " << cudaGetErrorString(error) << std::endl;
+                        std::cout << std::endl;
+                    }
+                }
+                
+                std::cout << "Use -d <id> or -d auto to enable GPU acceleration." << std::endl;
             }
+        } else {
+            std::cout << "No CUDA-capable GPU devices available." << std::endl;
         }
 #else
         std::cout << "CUDA support not compiled. Only CPU processing available." << std::endl;
@@ -294,8 +405,10 @@ public:
     // Cleanup GPU resources
     static void CleanupGPU() {
 #ifdef USE_CUDA
-        if (useGPU) {
+        if (useGPU || gpuInitialized) {
             CudaHashCalculator::Cleanup();
+            // Force reset CUDA context to free memory
+            cudaDeviceReset();
         }
 #endif
         useGPU = false;
