@@ -42,7 +42,7 @@ jobs:
       with:
         cuda: '12.8.0'
         method: 'network'
-        use-github-cache: true
+        # use-github-cache: false
         log-file-suffix: 'cuda-install.log'
         
     - name: Verify CUDA installation
