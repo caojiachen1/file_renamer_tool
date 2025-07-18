@@ -247,7 +247,17 @@ jobs:
         # 检查标签是否已存在
         $existing_tag = git tag -l $version
         if ($existing_tag) {
-          Write-Host "标签 $version 已存在，跳过创建"
+          Write-Host "标签 $version 已存在，复用现有标签"
+          # 检查远程是否也存在该标签
+          $remote_tag = git ls-remote --tags origin $version
+          if (-not $remote_tag) {
+            Write-Host "远程不存在标签 $version，推送到远程"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git push origin $version
+          } else {
+            Write-Host "远程也存在标签 $version，直接复用"
+          }
         } else {
           Write-Host "创建新标签: $version"
           git config user.name "github-actions[bot]"
@@ -389,33 +399,133 @@ jobs:
         
     - name: Create Release
       id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.version.outputs.version }}
-        release_name: File Renamer CLI Tool ${{ steps.version.outputs.version }}
-        body_path: release-notes.md
-        draft: false
-        prerelease: false
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        $release_name = "File Renamer CLI Tool $version"
+        
+        # 检查Release是否已存在
+        try {
+          $headers = @{
+            'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            'Accept' = 'application/vnd.github.v3+json'
+          }
+          
+          $existing_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$version" -Headers $headers -ErrorAction SilentlyContinue
+          
+          if ($existing_release) {
+            Write-Host "Release $version 已存在，复用现有Release"
+            Write-Host "Release ID: $($existing_release.id)"
+            Write-Host "Release URL: $($existing_release.html_url)"
+            
+            # 输出现有Release信息供后续步骤使用
+            Write-Output "upload_url=$($existing_release.upload_url)" >> $env:GITHUB_OUTPUT
+            Write-Output "html_url=$($existing_release.html_url)" >> $env:GITHUB_OUTPUT
+            Write-Output "id=$($existing_release.id)" >> $env:GITHUB_OUTPUT
+            Write-Output "created=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Release $version 不存在，创建新Release"
+            
+            # 读取release notes
+            $body = Get-Content "release-notes.md" -Raw -Encoding UTF8
+            
+            $release_data = @{
+              tag_name = $version
+              target_commitish = "main"
+              name = $release_name
+              body = $body
+              draft = $false
+              prerelease = $false
+            } | ConvertTo-Json -Depth 10
+            
+            $new_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases" -Method POST -Headers $headers -Body $release_data
+            
+            Write-Host "新Release已创建"
+            Write-Host "Release ID: $($new_release.id)"
+            Write-Host "Release URL: $($new_release.html_url)"
+            
+            # 输出新Release信息供后续步骤使用
+            Write-Output "upload_url=$($new_release.upload_url)" >> $env:GITHUB_OUTPUT
+            Write-Output "html_url=$($new_release.html_url)" >> $env:GITHUB_OUTPUT
+            Write-Output "id=$($new_release.id)" >> $env:GITHUB_OUTPUT
+            Write-Output "created=true" >> $env:GITHUB_OUTPUT
+          }
+        } catch {
+          Write-Error "处理Release时出错: $($_.Exception.Message)"
+          exit 1
+        }
         
     - name: Upload Release Asset - Main Executable
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: release-assets/file_renamer_cli_${{ steps.version.outputs.version }}_windows_x64.exe
-        asset_name: file_renamer_cli_${{ steps.version.outputs.version }}_windows_x64.exe
-        asset_content_type: application/octet-stream
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        $asset_name = "file_renamer_cli_$($version)_windows_x64.exe"
+        $asset_path = "release-assets/$asset_name"
+        $upload_url = "${{ steps.create_release.outputs.upload_url }}"
+        
+        # 检查文件是否存在
+        if (-not (Test-Path $asset_path)) {
+          Write-Error "找不到要上传的文件: $asset_path"
+          exit 1
+        }
+        
+        try {
+          $headers = @{
+            'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            'Content-Type' = 'application/octet-stream'
+          }
+          
+          # 检查Release中是否已存在同名文件
+          $release_id = "${{ steps.create_release.outputs.id }}"
+          $assets_url = "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets"
+          $existing_assets = Invoke-RestMethod -Uri $assets_url -Headers @{
+            'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            'Accept' = 'application/vnd.github.v3+json'
+          }
+          
+          $existing_asset = $existing_assets | Where-Object { $_.name -eq $asset_name }
+          
+          if ($existing_asset) {
+            Write-Host "文件 $asset_name 已存在于Release中，删除旧版本"
+            $delete_url = "https://api.github.com/repos/${{ github.repository }}/releases/assets/$($existing_asset.id)"
+            Invoke-RestMethod -Uri $delete_url -Method DELETE -Headers @{
+              'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            }
+            Write-Host "旧版本已删除"
+          }
+          
+          # 准备上传URL
+          $upload_url_clean = $upload_url -replace '\{\?name,label\}', "?name=$asset_name"
+          
+          # 读取文件并上传
+          $file_bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $asset_path))
+          $response = Invoke-RestMethod -Uri $upload_url_clean -Method POST -Headers $headers -Body $file_bytes
+          
+          Write-Host "✓ 文件上传成功: $asset_name"
+          Write-Host "  下载URL: $($response.browser_download_url)"
+          Write-Host "  文件大小: $([math]::Round($response.size/1KB, 2)) KB"
+          
+        } catch {
+          Write-Error "上传文件失败: $($_.Exception.Message)"
+          if ($_.Exception.Response) {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $responseBody = $reader.ReadToEnd()
+            Write-Error "响应内容: $responseBody"
+          }
+          exit 1
+        }
 
     - name: Build Summary
       shell: pwsh
       run: |
+        $created = "${{ steps.create_release.outputs.created }}"
+        $action = if ($created -eq "true") { "创建" } else { "复用" }
+        
         Write-Host "🎉 构建和发布完成！"
         Write-Host ""
         Write-Host "📋 构建摘要:"
         Write-Host "  版本: ${{ steps.version.outputs.version }}"
+        Write-Host "  Release操作: $action"
         Write-Host "  发布URL: ${{ steps.create_release.outputs.html_url }}"
         Write-Host ""
         Write-Host "📦 发布的文件:"
