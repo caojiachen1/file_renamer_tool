@@ -411,7 +411,20 @@ jobs:
             'Accept' = 'application/vnd.github.v3+json'
           }
           
-          $existing_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$version" -Headers $headers -ErrorAction SilentlyContinue
+          Write-Host "检查Release是否存在: $version"
+          $existing_release = $null
+          
+          try {
+            $existing_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$version" -Headers $headers
+            Write-Host "找到现有Release: $version"
+          } catch {
+            if ($_.Exception.Response.StatusCode -eq 404) {
+              Write-Host "Release $version 不存在，将创建新Release"
+              $existing_release = $null
+            } else {
+              throw $_.Exception
+            }
+          }
           
           if ($existing_release) {
             Write-Host "Release $version 已存在，复用现有Release"
@@ -424,7 +437,7 @@ jobs:
             Write-Output "id=$($existing_release.id)" >> $env:GITHUB_OUTPUT
             Write-Output "created=false" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "Release $version 不存在，创建新Release"
+            Write-Host "创建新Release: $version"
             
             # 读取release notes
             $body = Get-Content "release-notes.md" -Raw -Encoding UTF8
@@ -452,6 +465,8 @@ jobs:
           }
         } catch {
           Write-Error "处理Release时出错: $($_.Exception.Message)"
+          Write-Error "状态码: $($_.Exception.Response.StatusCode)"
+          Write-Error "详细信息: $($_.Exception.Response.StatusDescription)"
           exit 1
         }
         
@@ -478,27 +493,38 @@ jobs:
           # 检查Release中是否已存在同名文件
           $release_id = "${{ steps.create_release.outputs.id }}"
           $assets_url = "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets"
-          $existing_assets = Invoke-RestMethod -Uri $assets_url -Headers @{
-            'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
-            'Accept' = 'application/vnd.github.v3+json'
-          }
           
-          $existing_asset = $existing_assets | Where-Object { $_.name -eq $asset_name }
-          
-          if ($existing_asset) {
-            Write-Host "文件 $asset_name 已存在于Release中，删除旧版本"
-            $delete_url = "https://api.github.com/repos/${{ github.repository }}/releases/assets/$($existing_asset.id)"
-            Invoke-RestMethod -Uri $delete_url -Method DELETE -Headers @{
+          Write-Host "检查现有文件..."
+          try {
+            $existing_assets = Invoke-RestMethod -Uri $assets_url -Headers @{
               'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+              'Accept' = 'application/vnd.github.v3+json'
             }
-            Write-Host "旧版本已删除"
+            
+            $existing_asset = $existing_assets | Where-Object { $_.name -eq $asset_name }
+            
+            if ($existing_asset) {
+              Write-Host "文件 $asset_name 已存在于Release中，删除旧版本"
+              $delete_url = "https://api.github.com/repos/${{ github.repository }}/releases/assets/$($existing_asset.id)"
+              Invoke-RestMethod -Uri $delete_url -Method DELETE -Headers @{
+                'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+              }
+              Write-Host "旧版本已删除"
+            } else {
+              Write-Host "文件 $asset_name 不存在，准备上传新文件"
+            }
+          } catch {
+            Write-Host "检查现有文件时出错，继续上传: $($_.Exception.Message)"
           }
           
           # 准备上传URL
           $upload_url_clean = $upload_url -replace '\{\?name,label\}', "?name=$asset_name"
+          Write-Host "上传URL: $upload_url_clean"
           
           # 读取文件并上传
           $file_bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $asset_path))
+          Write-Host "文件大小: $([math]::Round($file_bytes.Length/1KB, 2)) KB"
+          
           $response = Invoke-RestMethod -Uri $upload_url_clean -Method POST -Headers $headers -Body $file_bytes
           
           Write-Host "✓ 文件上传成功: $asset_name"
@@ -507,10 +533,17 @@ jobs:
           
         } catch {
           Write-Error "上传文件失败: $($_.Exception.Message)"
+          Write-Error "状态码: $($_.Exception.Response.StatusCode)"
+          Write-Error "状态描述: $($_.Exception.Response.StatusDescription)"
+          
           if ($_.Exception.Response) {
-            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-            $responseBody = $reader.ReadToEnd()
-            Write-Error "响应内容: $responseBody"
+            try {
+              $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+              $responseBody = $reader.ReadToEnd()
+              Write-Error "响应内容: $responseBody"
+            } catch {
+              Write-Host "无法读取响应内容"
+            }
           }
           exit 1
         }
