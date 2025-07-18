@@ -273,9 +273,8 @@ jobs:
       run: |
         Write-Host "检查构建产物..."
         
-        $release_exe = "build\Release\file_renamer_cli.exe"
-        $debug_exe = "build\Debug\file_renamer_cli_d.exe"
-        $root_exe = "file_renamer_cli.exe"
+        $release_exe = "build\Release\file_renamer.exe"
+        $root_exe = "file_renamer.exe"
         
         if (Test-Path $release_exe) {
           Write-Host "✓ 找到 Release 版本: $release_exe"
@@ -309,7 +308,7 @@ jobs:
         # 复制主要可执行文件
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "file_renamer_cli_$($version)_windows_x64.exe"
-        Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
+        Copy-Item "build\Release\file_renamer.exe" "release-assets\$release_name"
         
         Write-Host "发布文件准备完成："
         Get-ChildItem "release-assets" | ForEach-Object {
@@ -351,17 +350,17 @@ jobs:
         $content += ""
         $content += "**预览模式**"
         $content += '```cmd'
-        $content += 'file_renamer_cli.exe "C:\MyFiles" -x jpg,png'
+        $content += 'file_renamer.exe "C:\MyFiles" -x jpg,png'
         $content += '```'
         $content += ""
         $content += "**执行重命名：**"
         $content += '```cmd'
-        $content += 'file_renamer_cli.exe "C:\MyFiles" -x jpg,png -e'
+        $content += 'file_renamer.exe "C:\MyFiles" -x jpg,png -e'
         $content += '```'
         $content += ""
         $content += "**更多选项：**"
         $content += '```cmd'
-        $content += 'file_renamer_cli.exe --help'
+        $content += 'file_renamer.exe --help'
         $content += '```'
         $content += ""
         $content += "系统要求"
