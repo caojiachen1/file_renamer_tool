@@ -14,10 +14,105 @@
 #include <future>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
 
 #pragma comment(lib, "advapi32.lib")
 
 namespace fs = std::filesystem;
+
+// High-performance thread pool with work-stealing and CPU affinity
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+    std::atomic<size_t> active_threads{0};
+
+    // Set CPU affinity for better performance
+    void SetThreadAffinity(size_t thread_id) {
+        DWORD_PTR mask = 1ULL << (thread_id % std::thread::hardware_concurrency());
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+
+public:
+    ThreadPool(size_t threads) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this, i] {
+                SetThreadAffinity(i);
+                
+                // Set high priority for hash calculation threads
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                
+                for (;;) {
+                    std::function<void()> task;
+                    
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
+                        
+                        if (this->stop && this->tasks.empty())
+                            return;
+                        
+                        if (!this->tasks.empty()) {
+                            task = std::move(this->tasks.front());
+                            this->tasks.pop();
+                            active_threads.fetch_add(1);
+                        }
+                    }
+                    
+                    if (task) {
+                        task();
+                        active_threads.fetch_sub(1);
+                    }
+                }
+            });
+        }
+    }
+
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<typename std::result_of<F(Args...)>::type> {
+        using return_type = typename std::result_of<F(Args...)>::type;
+
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+
+        std::future<return_type> res = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+
+            if (stop)
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+
+            tasks.emplace([task]() { (*task)(); });
+        }
+        condition.notify_one();
+        return res;
+    }
+
+    size_t active_count() const {
+        return active_threads.load();
+    }
+
+    size_t queue_size() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(queue_mutex));
+        return tasks.size();
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers)
+            worker.join();
+    }
+};
 
 class FileRenamerCLI {
 private:
@@ -543,6 +638,251 @@ public:
         return false;
     }
     
+    // Multi-threaded processing with buffered output to prevent output mixing
+    static void ProcessDirectoryMultiThreaded(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true, int numThreads = 0) {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
+        fs::path dir(directoryPath);
+        
+        if (!fs::exists(dir) || !fs::is_directory(dir)) {
+            std::cerr << "Error: Invalid directory path: " << directoryPath << std::endl;
+            return;
+        }
+        
+        // Auto-detect number of threads if not specified
+        if (numThreads <= 0) {
+            numThreads = std::thread::hardware_concurrency();
+            if (numThreads <= 0) numThreads = 4; // Fallback to 4 threads
+        }
+        
+        std::cout << "Scanning directory: " << directoryPath << std::endl;
+        std::cout << "Algorithm: " << algorithm << std::endl;
+        std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
+        std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
+        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
+        std::cout << "Threads: " << numThreads << std::endl;
+        
+        if (!allowedExtensions.empty()) {
+            std::cout << "Extensions filter: ";
+            for (size_t i = 0; i < allowedExtensions.size(); i++) {
+                std::cout << "\"" << allowedExtensions[i] << "\"";
+                if (i < allowedExtensions.size() - 1) {
+                    std::cout << ", ";
+                }
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "Extensions filter: All files" << std::endl;
+        }
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto scanStartTime = std::chrono::high_resolution_clock::now();
+        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto scanEndTime = std::chrono::high_resolution_clock::now();
+        
+        auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
+        std::cout << "Found " << files.size() << " files in " << scanDuration.count() << "ms." << std::endl << std::endl;
+        
+        if (files.empty()) {
+            std::cout << "No files found to process." << std::endl;
+            return;
+        }
+        
+        // Thread-safe counters
+        std::atomic<int> processedCount{0};
+        std::atomic<int> successCount{0};
+        std::atomic<int> skippedCount{0};
+        std::atomic<int> noChangeCount{0};
+        std::atomic<int> quickSkipCount{0};
+        std::atomic<int> currentIndex{0};
+        
+        // Output buffer system to prevent mixing
+        struct OutputBuffer {
+            std::string content;
+            size_t fileIndex;
+            bool ready;
+            
+            OutputBuffer() : fileIndex(0), ready(false) {}
+        };
+        
+        std::vector<OutputBuffer> outputBuffers(files.size());
+        std::mutex outputMutex;
+        std::atomic<size_t> nextOutputIndex{0};
+        
+        // Progress tracking
+        std::atomic<size_t> progress{0};
+        
+        // Create thread pool
+        std::vector<std::future<void>> futures;
+        
+        // Worker function
+        auto worker = [&]() {
+            while (true) {
+                // Get next file index atomically
+                size_t fileIndex = currentIndex.fetch_add(1);
+                if (fileIndex >= files.size()) {
+                    break;
+                }
+                
+                const auto& file = files[fileIndex];
+                std::stringstream buffer; // Local buffer for this file's output
+                
+                try {
+                    std::string fileName = file.filename().string();
+                    
+                    // Build output in local buffer first
+                    buffer << "[" << (fileIndex + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
+                    
+                    // Check if file extension matches filter
+                    if (!ShouldProcessFile(file, allowedExtensions)) {
+                        std::string extension = file.extension().string();
+                        buffer << "  Extension: \"" << extension << "\"" << std::endl;
+                        buffer << "  Status: Skipped (extension not in filter)" << std::endl;
+                        buffer << std::endl;
+                        skippedCount++;
+                        
+                        // Store in output buffer
+                        outputBuffers[fileIndex].content = buffer.str();
+                        outputBuffers[fileIndex].fileIndex = fileIndex;
+                        outputBuffers[fileIndex].ready = true;
+                        continue;
+                    }
+                    
+                    // Quick check optimization for files that likely already have correct hash names
+                    if (quickCheck && QuickHashCheck(file, algorithm)) {
+                        buffer << "  Status: Likely already correctly named (quick check passed)" << std::endl;
+                        buffer << std::endl;
+                        quickSkipCount++;
+                        
+                        // Store in output buffer
+                        outputBuffers[fileIndex].content = buffer.str();
+                        outputBuffers[fileIndex].fileIndex = fileIndex;
+                        outputBuffers[fileIndex].ready = true;
+                        continue;
+                    }
+                    
+                    processedCount++;
+                    
+                    std::string hash = CalculateFileHashOptimized(file, algorithm);
+                    if (hash.empty()) {
+                        buffer << "  Error: Could not calculate hash" << std::endl;
+                        buffer << std::endl;
+                        
+                        // Store in output buffer
+                        outputBuffers[fileIndex].content = buffer.str();
+                        outputBuffers[fileIndex].fileIndex = fileIndex;
+                        outputBuffers[fileIndex].ready = true;
+                        continue;
+                    }
+                    
+                    std::string extension = file.extension().string();
+                    std::string newFileName = hash + extension;
+                    fs::path newPath = file.parent_path() / newFileName;
+                    
+                    buffer << "  Hash (" << algorithm << "): " << hash << std::endl;
+                    buffer << "  New name: " << newFileName << std::endl;
+                    
+                    // Check if the new filename is the same as the current filename
+                    if (file.filename() == newFileName) {
+                        buffer << "  Status: No change needed (filename already matches hash)" << std::endl;
+                        buffer << std::endl;
+                        noChangeCount++;
+                    } else if (!dryRun) {
+                        if (RenameFile(file, newPath)) {
+                            buffer << "  Status: Renamed successfully" << std::endl;
+                            buffer << std::endl;
+                            successCount++;
+                        } else {
+                            buffer << "  Status: Failed to rename" << std::endl;
+                            buffer << std::endl;
+                        }
+                    } else {
+                        buffer << "  Status: Preview only (will be renamed)" << std::endl;
+                        buffer << std::endl;
+                    }
+                    
+                } catch (const std::exception& ex) {
+                    buffer << "[" << (fileIndex + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
+                    buffer << "  Error: " << ex.what() << std::endl;
+                    buffer << std::endl;
+                    skippedCount++;
+                }
+                
+                // Store completed output in buffer
+                outputBuffers[fileIndex].content = buffer.str();
+                outputBuffers[fileIndex].fileIndex = fileIndex;
+                outputBuffers[fileIndex].ready = true;
+                
+                // Update progress
+                progress.fetch_add(1);
+            }
+        };
+        
+        // Output thread to maintain proper order
+        auto outputWorker = [&]() {
+            while (nextOutputIndex.load() < files.size()) {
+                size_t currentOutput = nextOutputIndex.load();
+                if (currentOutput < files.size() && outputBuffers[currentOutput].ready) {
+                    {
+                        std::lock_guard<std::mutex> lock(outputMutex);
+                        std::cout << outputBuffers[currentOutput].content << std::flush;
+                    }
+                    nextOutputIndex.fetch_add(1);
+                } else {
+                    // Wait a bit before checking again
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+        };
+        
+        // Launch output thread
+        std::future<void> outputFuture = std::async(std::launch::async, outputWorker);
+        
+        // Launch worker threads
+        for (int i = 0; i < numThreads; i++) {
+            futures.push_back(std::async(std::launch::async, worker));
+        }
+        
+        // Wait for all threads to complete
+        for (auto& future : futures) {
+            future.wait();
+        }
+        
+        // Wait for output thread to finish
+        outputFuture.wait();
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+        
+        std::cout << "Summary:" << std::endl;
+        std::cout << "Total files: " << files.size() << std::endl;
+        std::cout << "Processed: " << processedCount.load() << std::endl;
+        std::cout << "Skipped (filter): " << skippedCount.load() << std::endl;
+        if (quickCheck) {
+            std::cout << "Quick-skipped (likely correct): " << quickSkipCount.load() << std::endl;
+        }
+        std::cout << "No change needed: " << noChangeCount.load() << std::endl;
+        if (!dryRun) {
+            std::cout << "Successfully renamed: " << successCount.load() << std::endl;
+            std::cout << "Failed: " << (processedCount.load() - successCount.load() - noChangeCount.load()) << std::endl;
+        }
+        std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
+        
+        if (processedCount.load() > 0) {
+            double avgTimePerFile = static_cast<double>(totalDuration.count()) / processedCount.load();
+            std::cout << "Average time per file: " << std::fixed << std::setprecision(2) << avgTimePerFile << "ms" << std::endl;
+        }
+        
+        if (quickCheck && quickSkipCount.load() > 0) {
+            std::cout << "Time saved by quick check: ~" << (quickSkipCount.load() * 10) << "ms (estimated)" << std::endl;
+        }
+        
+        std::cout << "Performance: " << numThreads << " threads utilized with sequential output" << std::endl;
+    }
+
     static void ProcessDirectory(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true) {
         auto startTime = std::chrono::high_resolution_clock::now();
         
@@ -679,6 +1019,526 @@ public:
             std::cout << "Time saved by quick check: ~" << (quickSkipCount * 10) << "ms (estimated)" << std::endl;
         }
     }
+    // Ultra-high performance processing with ordered output
+    static void ProcessDirectoryUltraFast(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true, int numThreads = 0) {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
+        fs::path dir(directoryPath);
+        
+        if (!fs::exists(dir) || !fs::is_directory(dir)) {
+            std::cerr << "Error: Invalid directory path: " << directoryPath << std::endl;
+            return;
+        }
+        
+        // Auto-detect optimal number of threads
+        if (numThreads <= 0) {
+            numThreads = std::thread::hardware_concurrency();
+            if (numThreads <= 0) numThreads = 4;
+            // Use more threads for I/O bound operations
+            numThreads = std::min(numThreads * 2, 32);
+        }
+        
+        std::cout << "Ultra-fast processing mode enabled!" << std::endl;
+        std::cout << "Scanning directory: " << directoryPath << std::endl;
+        std::cout << "Algorithm: " << algorithm << std::endl;
+        std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
+        std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
+        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
+        std::cout << "Optimized threads: " << numThreads << std::endl;
+        
+        if (!allowedExtensions.empty()) {
+            std::cout << "Extensions filter: ";
+            for (size_t i = 0; i < allowedExtensions.size(); i++) {
+                std::cout << "\"" << allowedExtensions[i] << "\"";
+                if (i < allowedExtensions.size() - 1) {
+                    std::cout << ", ";
+                }
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "Extensions filter: All files" << std::endl;
+        }
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto scanStartTime = std::chrono::high_resolution_clock::now();
+        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto scanEndTime = std::chrono::high_resolution_clock::now();
+        
+        auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
+        std::cout << "Found " << files.size() << " files in " << scanDuration.count() << "ms." << std::endl << std::endl;
+        
+        if (files.empty()) {
+            std::cout << "No files found to process." << std::endl;
+            return;
+        }
+        
+        // Initialize thread pool
+        ThreadPool pool(numThreads);
+        
+        // Thread-safe counters
+        std::atomic<int> processedCount{0};
+        std::atomic<int> successCount{0};
+        std::atomic<int> skippedCount{0};
+        std::atomic<int> noChangeCount{0};
+        std::atomic<int> quickSkipCount{0};
+        
+        // Output buffer system for ordered output
+        struct OutputBuffer {
+            std::string content;
+            size_t fileIndex;
+            bool ready;
+            std::chrono::steady_clock::time_point timestamp;
+            
+            OutputBuffer() : fileIndex(0), ready(false) {}
+        };
+        
+        std::vector<OutputBuffer> outputBuffers(files.size());
+        std::mutex outputMutex;
+        std::atomic<size_t> nextOutputIndex{0};
+        std::atomic<size_t> completedTasks{0};
+        
+        // Progress tracking with minimal output
+        std::atomic<bool> showProgress{files.size() > 50}; // Only show progress for large datasets
+        
+        // Submit all tasks to thread pool
+        std::vector<std::future<void>> futures;
+        futures.reserve(files.size());
+        
+        for (size_t i = 0; i < files.size(); i++) {
+            futures.push_back(pool.enqueue([&, i]() {
+                const auto& file = files[i];
+                std::stringstream buffer;
+                auto taskStart = std::chrono::steady_clock::now();
+                
+                try {
+                    std::string fileName = file.filename().string();
+                    
+                    // Build output in local buffer
+                    buffer << "[" << (i + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
+                    
+                    // Check if file extension matches filter
+                    if (!ShouldProcessFile(file, allowedExtensions)) {
+                        std::string extension = file.extension().string();
+                        buffer << "  Extension: \"" << extension << "\"" << std::endl;
+                        buffer << "  Status: Skipped (extension not in filter)" << std::endl;
+                        buffer << std::endl;
+                        skippedCount++;
+                        
+                        // Store in output buffer
+                        outputBuffers[i].content = buffer.str();
+                        outputBuffers[i].fileIndex = i;
+                        outputBuffers[i].timestamp = taskStart;
+                        outputBuffers[i].ready = true;
+                        return;
+                    }
+                    
+                    // Quick check optimization
+                    if (quickCheck && QuickHashCheck(file, algorithm)) {
+                        buffer << "  Status: Likely already correctly named (quick check passed)" << std::endl;
+                        buffer << std::endl;
+                        quickSkipCount++;
+                        
+                        // Store in output buffer
+                        outputBuffers[i].content = buffer.str();
+                        outputBuffers[i].fileIndex = i;
+                        outputBuffers[i].timestamp = taskStart;
+                        outputBuffers[i].ready = true;
+                        return;
+                    }
+                    
+                    processedCount++;
+                    
+                    std::string hash = CalculateFileHashOptimized(file, algorithm);
+                    if (hash.empty()) {
+                        buffer << "  Error: Could not calculate hash" << std::endl;
+                        buffer << std::endl;
+                        
+                        // Store in output buffer
+                        outputBuffers[i].content = buffer.str();
+                        outputBuffers[i].fileIndex = i;
+                        outputBuffers[i].timestamp = taskStart;
+                        outputBuffers[i].ready = true;
+                        return;
+                    }
+                    
+                    std::string extension = file.extension().string();
+                    std::string newFileName = hash + extension;
+                    fs::path newPath = file.parent_path() / newFileName;
+                    
+                    buffer << "  Hash (" << algorithm << "): " << hash << std::endl;
+                    buffer << "  New name: " << newFileName << std::endl;
+                    
+                    // Check if the new filename is the same as the current filename
+                    if (file.filename() == newFileName) {
+                        buffer << "  Status: No change needed (filename already matches hash)" << std::endl;
+                        buffer << std::endl;
+                        noChangeCount++;
+                    } else if (!dryRun) {
+                        if (RenameFile(file, newPath)) {
+                            buffer << "  Status: Renamed successfully" << std::endl;
+                            buffer << std::endl;
+                            successCount++;
+                        } else {
+                            buffer << "  Status: Failed to rename" << std::endl;
+                            buffer << std::endl;
+                        }
+                    } else {
+                        buffer << "  Status: Preview only (will be renamed)" << std::endl;
+                        buffer << std::endl;
+                    }
+                    
+                } catch (const std::exception& ex) {
+                    buffer << "[" << (i + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
+                    buffer << "  Error: " << ex.what() << std::endl;
+                    buffer << std::endl;
+                    skippedCount++;
+                }
+                
+                // Store completed output
+                outputBuffers[i].content = buffer.str();
+                outputBuffers[i].fileIndex = i;
+                outputBuffers[i].timestamp = taskStart;
+                outputBuffers[i].ready = true;
+                
+                completedTasks.fetch_add(1);
+            }));
+        }
+        
+        // Output thread to maintain proper order
+        auto outputWorker = [&]() {
+            while (nextOutputIndex.load() < files.size()) {
+                size_t currentOutput = nextOutputIndex.load();
+                if (currentOutput < files.size() && outputBuffers[currentOutput].ready) {
+                    {
+                        std::lock_guard<std::mutex> lock(outputMutex);
+                        std::cout << outputBuffers[currentOutput].content << std::flush;
+                    }
+                    nextOutputIndex.fetch_add(1);
+                } else {
+                    // Wait briefly before checking again
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+            }
+        };
+        
+        // Progress monitor thread (optional for large datasets)
+        auto progressMonitor = [&]() {
+            if (!showProgress.load()) return;
+            
+            auto lastUpdate = std::chrono::steady_clock::now();
+            while (completedTasks.load() < files.size()) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdate).count() >= 2) {
+                    size_t completed = completedTasks.load();
+                    size_t active = pool.active_count();
+                    size_t queued = pool.queue_size();
+                    
+                    std::lock_guard<std::mutex> lock(outputMutex);
+                    std::cout << "\r[PROGRESS] " << completed << "/" << files.size() 
+                              << " (" << (completed * 100 / files.size()) << "%) - "
+                              << "Active: " << active << ", Queued: " << queued << "    " << std::flush;
+                    
+                    lastUpdate = now;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (showProgress.load()) {
+                std::lock_guard<std::mutex> lock(outputMutex);
+                std::cout << "\r" << std::string(80, ' ') << "\r" << std::flush; // Clear progress line
+            }
+        };
+        
+        // Launch threads
+        std::future<void> outputFuture = std::async(std::launch::async, outputWorker);
+        std::future<void> progressFuture = std::async(std::launch::async, progressMonitor);
+        
+        // Wait for all tasks to complete
+        for (auto& future : futures) {
+            future.wait();
+        }
+        
+        // Wait for output and progress threads
+        outputFuture.wait();
+        progressFuture.wait();
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+        
+        std::cout << "Summary:" << std::endl;
+        std::cout << "Total files: " << files.size() << std::endl;
+        std::cout << "Processed: " << processedCount.load() << std::endl;
+        std::cout << "Skipped (filter): " << skippedCount.load() << std::endl;
+        if (quickCheck) {
+            std::cout << "Quick-skipped (likely correct): " << quickSkipCount.load() << std::endl;
+        }
+        std::cout << "No change needed: " << noChangeCount.load() << std::endl;
+        if (!dryRun) {
+            std::cout << "Successfully renamed: " << successCount.load() << std::endl;
+            std::cout << "Failed: " << (processedCount.load() - successCount.load() - noChangeCount.load()) << std::endl;
+        }
+        std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
+        
+        if (processedCount.load() > 0) {
+            double avgTimePerFile = static_cast<double>(totalDuration.count()) / processedCount.load();
+            std::cout << "Average time per file: " << std::fixed << std::setprecision(2) << avgTimePerFile << "ms" << std::endl;
+            
+            double filesPerSecond = (processedCount.load() * 1000.0) / totalDuration.count();
+            std::cout << "Ultra-fast throughput: " << std::fixed << std::setprecision(2) << filesPerSecond << " files/second" << std::endl;
+        }
+        
+        if (quickCheck && quickSkipCount.load() > 0) {
+            std::cout << "Time saved by quick check: ~" << (quickSkipCount.load() * 10) << "ms (estimated)" << std::endl;
+        }
+        
+        std::cout << "Performance: " << numThreads << " optimized threads with ordered output" << std::endl;
+    }
+
+    // Batch processing with smart load balancing
+    static void ProcessDirectoryBatch(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true, int numThreads = 0, size_t batchSize = 0) {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
+        fs::path dir(directoryPath);
+        
+        if (!fs::exists(dir) || !fs::is_directory(dir)) {
+            std::cerr << "Error: Invalid directory path: " << directoryPath << std::endl;
+            return;
+        }
+        
+        // Auto-detect optimal settings
+        if (numThreads <= 0) {
+            numThreads = std::thread::hardware_concurrency();
+            if (numThreads <= 0) numThreads = 4;
+        }
+        
+        if (batchSize == 0) {
+            batchSize = std::max(1ULL, static_cast<size_t>(numThreads * 2)); // 2 batches per thread
+        }
+        
+        std::cout << "Scanning directory: " << directoryPath << std::endl;
+        std::cout << "Algorithm: " << algorithm << std::endl;
+        std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
+        std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
+        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
+        std::cout << "Threads: " << numThreads << std::endl;
+        std::cout << "Batch size: " << batchSize << std::endl;
+        
+        if (!allowedExtensions.empty()) {
+            std::cout << "Extensions filter: ";
+            for (size_t i = 0; i < allowedExtensions.size(); i++) {
+                std::cout << "\"" << allowedExtensions[i] << "\"";
+                if (i < allowedExtensions.size() - 1) {
+                    std::cout << ", ";
+                }
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "Extensions filter: All files" << std::endl;
+        }
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto scanStartTime = std::chrono::high_resolution_clock::now();
+        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto scanEndTime = std::chrono::high_resolution_clock::now();
+        
+        auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
+        std::cout << "Found " << files.size() << " files in " << scanDuration.count() << "ms." << std::endl << std::endl;
+        
+        if (files.empty()) {
+            std::cout << "No files found to process." << std::endl;
+            return;
+        }
+        
+        // Sort files by size for better load balancing (mix of small and large files)
+        std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+            std::error_code ec1, ec2;
+            auto sizeA = fs::file_size(a, ec1);
+            auto sizeB = fs::file_size(b, ec2);
+            if (ec1 || ec2) return false;
+            return sizeA > sizeB; // Large files first for better scheduling
+        });
+        
+        // Create batches
+        std::vector<std::vector<fs::path>> batches;
+        for (size_t i = 0; i < files.size(); i += batchSize) {
+            std::vector<fs::path> batch;
+            size_t end = std::min(i + batchSize, files.size());
+            batch.assign(files.begin() + i, files.begin() + end);
+            batches.push_back(std::move(batch));
+        }
+        
+        std::cout << "Created " << batches.size() << " batches for processing." << std::endl << std::endl;
+        
+        // Thread-safe counters
+        std::atomic<int> processedCount{0};
+        std::atomic<int> successCount{0};
+        std::atomic<int> skippedCount{0};
+        std::atomic<int> noChangeCount{0};
+        std::atomic<int> quickSkipCount{0};
+        std::atomic<size_t> currentBatch{0};
+        
+        // Thread-safe output mutex
+        std::mutex outputMutex;
+        
+        // Worker function for batch processing
+        auto batchWorker = [&]() {
+            while (true) {
+                // Get next batch index atomically
+                size_t batchIndex = currentBatch.fetch_add(1);
+                if (batchIndex >= batches.size()) {
+                    break;
+                }
+                
+                const auto& batch = batches[batchIndex];
+                
+                // Process all files in this batch
+                for (size_t fileIndex = 0; fileIndex < batch.size(); fileIndex++) {
+                    const auto& file = batch[fileIndex];
+                    
+                    try {
+                        std::string fileName = file.filename().string();
+                        size_t globalIndex = batchIndex * batchSize + fileIndex;
+                        
+                        // Thread-safe progress output
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            std::cout << "[" << (globalIndex + 1) << "/" << files.size() << "] Batch " << (batchIndex + 1) << "/" << batches.size() << " Processing: \"" << fileName << "\"" << std::endl;
+                        }
+                        
+                        // Check if file extension matches filter
+                        if (!ShouldProcessFile(file, allowedExtensions)) {
+                            std::string extension = file.extension().string();
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << "  Extension: \"" << extension << "\"" << std::endl;
+                                std::cout << "  Status: Skipped (extension not in filter)" << std::endl;
+                                std::cout << std::endl;
+                            }
+                            skippedCount++;
+                            continue;
+                        }
+                        
+                        // Quick check optimization
+                        if (quickCheck && QuickHashCheck(file, algorithm)) {
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << "  Status: Likely already correctly named (quick check passed)" << std::endl;
+                                std::cout << std::endl;
+                            }
+                            quickSkipCount++;
+                            continue;
+                        }
+                        
+                        processedCount++;
+                        
+                        std::string hash = CalculateFileHashOptimized(file, algorithm);
+                        if (hash.empty()) {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            std::cout << "  Error: Could not calculate hash" << std::endl;
+                            std::cout << std::endl;
+                            continue;
+                        }
+                        
+                        std::string extension = file.extension().string();
+                        std::string newFileName = hash + extension;
+                        fs::path newPath = file.parent_path() / newFileName;
+                        
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            std::cout << "  Hash (" << algorithm << "): " << hash << std::endl;
+                            std::cout << "  New name: " << newFileName << std::endl;
+                        }
+                        
+                        // Check if the new filename is the same as the current filename
+                        if (file.filename() == newFileName) {
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << "  Status: No change needed (filename already matches hash)" << std::endl;
+                                std::cout << std::endl;
+                            }
+                            noChangeCount++;
+                        } else if (!dryRun) {
+                            if (RenameFile(file, newPath)) {
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    std::cout << "  Status: Renamed successfully" << std::endl;
+                                    std::cout << std::endl;
+                                }
+                                successCount++;
+                            } else {
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    std::cout << "  Status: Failed to rename" << std::endl;
+                                    std::cout << std::endl;
+                                }
+                            }
+                        } else {
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << "  Status: Preview only (will be renamed)" << std::endl;
+                                std::cout << std::endl;
+                            }
+                        }
+                        
+                    } catch (const std::exception& ex) {
+                        std::lock_guard<std::mutex> lock(outputMutex);
+                        size_t globalIndex = batchIndex * batchSize + fileIndex;
+                        std::cout << "[" << (globalIndex + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
+                        std::cout << "  Error: " << ex.what() << std::endl;
+                        std::cout << std::endl;
+                        skippedCount++;
+                    }
+                }
+            }
+        };
+        
+        // Launch worker threads
+        std::vector<std::future<void>> futures;
+        for (int i = 0; i < numThreads; i++) {
+            futures.push_back(std::async(std::launch::async, batchWorker));
+        }
+        
+        // Wait for all threads to complete
+        for (auto& future : futures) {
+            future.wait();
+        }
+        
+        std::cout << "===========================================" << std::endl;
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
+        
+        std::cout << "Summary:" << std::endl;
+        std::cout << "Total files: " << files.size() << std::endl;
+        std::cout << "Processed: " << processedCount.load() << std::endl;
+        std::cout << "Skipped (filter): " << skippedCount.load() << std::endl;
+        if (quickCheck) {
+            std::cout << "Quick-skipped (likely correct): " << quickSkipCount.load() << std::endl;
+        }
+        std::cout << "No change needed: " << noChangeCount.load() << std::endl;
+        if (!dryRun) {
+            std::cout << "Successfully renamed: " << successCount.load() << std::endl;
+            std::cout << "Failed: " << (processedCount.load() - successCount.load() - noChangeCount.load()) << std::endl;
+        }
+        std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
+        
+        if (processedCount.load() > 0) {
+            double avgTimePerFile = static_cast<double>(totalDuration.count()) / processedCount.load();
+            std::cout << "Average time per file: " << std::fixed << std::setprecision(2) << avgTimePerFile << "ms" << std::endl;
+            
+            double filesPerSecond = (processedCount.load() * 1000.0) / totalDuration.count();
+            std::cout << "Throughput: " << std::fixed << std::setprecision(2) << filesPerSecond << " files/second" << std::endl;
+        }
+        
+        if (quickCheck && quickSkipCount.load() > 0) {
+            std::cout << "Time saved by quick check: ~" << (quickSkipCount.load() * 10) << "ms (estimated)" << std::endl;
+        }
+        
+        std::cout << "Performance: " << numThreads << " threads, " << batches.size() << " batches utilized" << std::endl;
+    }
 };
 
 // Static member definition
@@ -686,7 +1546,7 @@ const char FileRenamerCLI::HEX_CHARS[16] = {'0','1','2','3','4','5','6','7','8',
 
 void PrintUsage() {
     std::cout << "File Batch Renamer Tool" << std::endl;
-    std::cout << "=======================" << std::endl;
+    std::cout << "=========================================" << std::endl;
     std::cout << "Usage: file_renamer <directory> [options]" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
@@ -697,14 +1557,29 @@ void PrintUsage() {
     std::cout << "                          (e.g., jpg,png,txt or .jpg,.png,.txt)" << std::endl;
     std::cout << "  -q, --quick             Enable quick check for already-named files [default: on]" << std::endl;
     std::cout << "  --no-quick              Disable quick check (force full hash calculation)" << std::endl;
+    std::cout << "  -t, --threads <n>       Number of processing threads [default: auto-detect]" << std::endl;
+    std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
+    std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
+    std::cout << "  --multi-thread          Use multi-threaded processing [default]" << std::endl;
+    std::cout << "  --batch-mode            Use batch processing mode (best for large datasets)" << std::endl;
     std::cout << "  -h, --help              Show this help message" << std::endl;
     std::cout << std::endl;
+    std::cout << "Processing Modes:" << std::endl;
+    std::cout << "  Single-thread: Original sequential processing" << std::endl;
+    std::cout << "  Multi-thread:  Parallel processing with work-stealing" << std::endl;
+    std::cout << "  Batch-mode:    Optimized batch processing for large datasets" << std::endl;
+    std::cout << "  Ultra-fast:    Maximum performance with thread pool and CPU affinity [default]" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Additional Options:" << std::endl;
+    std::cout << "  --ultra-fast            Use ultra-fast processing mode with thread pool" << std::endl;
+    std::cout << std::endl;
     std::cout << "Examples:" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles                              # Preview all files with MD5" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -x jpg,png                   # Preview only jpg and png files" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -x .txt,.log      # Preview txt/log files with SHA1, recursive" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -e -x jpg                    # Execute renaming for jpg files only" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles --no-quick                   # Force full hash check on all files" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles                              # Multi-threaded preview with auto-detected threads" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -x jpg,png -t 8              # Use 8 threads for jpg/png files" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles --batch-mode -b 50            # Batch mode with 50 files per batch" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles --single-thread               # Original single-threaded mode" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -e -t 16           # Execute SHA1 renaming with 16 threads, recursive" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles --no-quick -t 4               # Force full hash check with 4 threads" << std::endl;
 }
 
 std::vector<std::string> ParseExtensions(const std::string& extensionsStr) {
@@ -741,6 +1616,10 @@ int main(int argc, char* argv[]) {
     bool dryRun = true;
     bool showHelp = false;
     bool quickCheck = true; // Enable quick check by default
+    int numThreads = 0; // Auto-detect by default
+    size_t batchSize = 0; // Auto-calculate by default
+    enum ProcessingMode { ULTRA_FAST, MULTI_THREAD, BATCH_MODE, SINGLE_THREAD };
+    ProcessingMode mode = ULTRA_FAST; // Default to ultra-fast mode
     std::vector<std::string> allowedExtensions;
     
     // Parse command line arguments
@@ -758,11 +1637,31 @@ int main(int argc, char* argv[]) {
             quickCheck = true;
         } else if (arg == "--no-quick") {
             quickCheck = false;
+        } else if (arg == "--ultra-fast") {
+            mode = ULTRA_FAST;
+        } else if (arg == "--single-thread") {
+            mode = SINGLE_THREAD;
+        } else if (arg == "--multi-thread") {
+            mode = MULTI_THREAD;
+        } else if (arg == "--batch-mode") {
+            mode = BATCH_MODE;
         } else if ((arg == "-a" || arg == "--algorithm") && i + 1 < argc) {
             algorithm = argv[++i];
             if (algorithm != "MD5" && algorithm != "SHA1") {
                 std::cerr << "Error: Unsupported algorithm: " << algorithm << std::endl;
                 std::cerr << "Supported algorithms: MD5, SHA1" << std::endl;
+                return 1;
+            }
+        } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            numThreads = std::atoi(argv[++i]);
+            if (numThreads <= 0) {
+                std::cerr << "Error: Invalid number of threads: " << numThreads << std::endl;
+                return 1;
+            }
+        } else if ((arg == "-b" || arg == "--batch") && i + 1 < argc) {
+            batchSize = std::atoi(argv[++i]);
+            if (batchSize <= 0) {
+                std::cerr << "Error: Invalid batch size: " << batchSize << std::endl;
                 return 1;
             }
         } else if ((arg == "-x" || arg == "--extensions") && i + 1 < argc) {
@@ -805,7 +1704,25 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    FileRenamerCLI::ProcessDirectory(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck);
+    // Choose processing mode
+    switch (mode) {
+        case SINGLE_THREAD:
+            std::cout << "Using single-threaded processing mode." << std::endl;
+            FileRenamerCLI::ProcessDirectory(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck);
+            break;
+        case MULTI_THREAD:
+            std::cout << "Using multi-threaded processing mode." << std::endl;
+            FileRenamerCLI::ProcessDirectoryMultiThreaded(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads);
+            break;
+        case BATCH_MODE:
+            std::cout << "Using batch processing mode." << std::endl;
+            FileRenamerCLI::ProcessDirectoryBatch(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads, batchSize);
+            break;
+        case ULTRA_FAST:
+            std::cout << "Using ultra-fast processing mode." << std::endl;
+            FileRenamerCLI::ProcessDirectoryUltraFast(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads);
+            break;
+    }
     
     return 0;
 }
