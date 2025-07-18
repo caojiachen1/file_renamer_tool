@@ -16,8 +16,18 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <functional>
 
 #pragma comment(lib, "advapi32.lib")
+
+// CUDA support (optional compilation)
+#ifdef USE_CUDA
+    #include "cuda_hash.cuh"
+    #pragma comment(lib, "cudart.lib")
+    #define CUDA_AVAILABLE true
+#else
+    #define CUDA_AVAILABLE false
+#endif
 
 namespace fs = std::filesystem;
 
@@ -119,6 +129,12 @@ private:
     // Optimized hex conversion using lookup table with SIMD-friendly approach
     static const char HEX_CHARS[16];
     
+    // GPU acceleration support
+    static bool gpuInitialized;
+    static bool useGPU;
+    static size_t gpuMinFileSize;
+    static int selectedDevice;
+    
     // CPU-optimized hex conversion for better performance
     static std::string BytesToHexOptimized(const BYTE* data, DWORD length) {
         std::string result;
@@ -153,6 +169,145 @@ private:
     }
 
 public:
+    // GPU acceleration functions
+    static bool InitializeGPU(int deviceId = -2) { // -2 means auto, -1 means CPU, >=0 means specific GPU
+        if (gpuInitialized) return useGPU;
+        
+        gpuInitialized = true;
+        
+        // If specifically requesting CPU
+        if (deviceId == -1) {
+            useGPU = false;
+            selectedDevice = -1;
+            std::cout << "Using CPU processing (Device -1)" << std::endl;
+            return false; // Return false for GPU, but this is expected for CPU
+        }
+        
+#ifdef USE_CUDA
+        if (CudaHashCalculator::Initialize()) {
+            // If deviceId is specified and >= 0, try to select that device
+            if (deviceId >= 0) {
+                const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
+                if (deviceId < gpuInfo.deviceCount) {
+                    cudaError_t error = cudaSetDevice(deviceId);
+                    if (error == cudaSuccess) {
+                        selectedDevice = deviceId;
+                        useGPU = true;
+                        gpuMinFileSize = 4096; // 4KB minimum for GPU processing
+                        std::cout << "GPU acceleration enabled on device " << deviceId 
+                                  << " (" << gpuInfo.devices[deviceId].name << ")" << std::endl;
+                        return true;
+                    } else {
+                        std::cout << "Failed to select device " << deviceId 
+                                  << ": " << cudaGetErrorString(error) << std::endl;
+                        std::cout << "Falling back to CPU processing..." << std::endl;
+                    }
+                } else {
+                    std::cout << "Invalid device ID " << deviceId 
+                              << ". Available GPU devices: 0-" << (gpuInfo.deviceCount - 1) << std::endl;
+                    std::cout << "Falling back to CPU processing..." << std::endl;
+                }
+            }
+            
+            // Auto-selection (deviceId == -2) or fallback
+            else if (deviceId == -2) {
+                if (CudaHashCalculator::SelectBestDevice()) {
+                    selectedDevice = CudaHashCalculator::GetGPUInfo().selectedDevice;
+                    useGPU = true;
+                    gpuMinFileSize = 4096; // 4KB minimum for GPU processing
+                    std::cout << "GPU acceleration auto-enabled on device " << selectedDevice
+                              << " (" << CudaHashCalculator::GetGPUInfo().devices[selectedDevice].name << ")" << std::endl;
+                    return true;
+                } else {
+                    std::cout << "No suitable GPU found, using CPU processing" << std::endl;
+                }
+            }
+        } else {
+            if (deviceId >= 0) {
+                std::cout << "CUDA initialization failed, cannot use GPU device " << deviceId << std::endl;
+            }
+            std::cout << "GPU acceleration not available, using CPU processing" << std::endl;
+        }
+#else
+        if (deviceId >= 0) {
+            std::cout << "CUDA support not compiled, cannot use GPU device " << deviceId << std::endl;
+        }
+        std::cout << "Using CPU processing (CUDA not available)" << std::endl;
+#endif
+        
+        // Fallback to CPU
+        useGPU = false;
+        selectedDevice = -1;
+        return false;
+    }
+    
+    // Get current selected device
+    static int GetSelectedDevice() {
+        return selectedDevice;
+    }
+    
+    // List available devices (CPU and GPU)
+    static void ListAvailableDevices() {
+        std::cout << "Available computing devices:" << std::endl;
+        
+        // Always show CPU as device -1
+        std::cout << "  Device -1: CPU (Multi-threaded)" << std::endl;
+        std::cout << "    Type: CPU" << std::endl;
+        std::cout << "    Threads: " << std::thread::hardware_concurrency() << std::endl;
+        std::cout << "    Status: Always available" << std::endl;
+        std::cout << std::endl;
+        
+#ifdef USE_CUDA
+        if (!gpuInitialized) {
+            // Temporarily initialize to get device info
+            CudaHashCalculator::Initialize();
+        }
+        
+        const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
+        
+        if (gpuInfo.deviceCount == 0) {
+            std::cout << "No CUDA-capable GPU devices found." << std::endl;
+        } else {
+            for (int i = 0; i < gpuInfo.deviceCount; i++) {
+                const auto& device = gpuInfo.devices[i];
+                std::cout << "  Device " << i << ": " << device.name << std::endl;
+                std::cout << "    Type: GPU (CUDA)" << std::endl;
+                std::cout << "    Compute Capability: " << device.major << "." << device.minor << std::endl;
+                std::cout << "    Global Memory: " << (device.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
+                std::cout << "    Multiprocessors: " << device.multiProcessorCount << std::endl;
+                std::cout << "    Max Threads per Block: " << device.maxThreadsPerBlock << std::endl;
+                if (selectedDevice == i && useGPU) {
+                    std::cout << "    Status: Currently selected" << std::endl;
+                }
+                std::cout << std::endl;
+            }
+        }
+#else
+        std::cout << "CUDA support not compiled. Only CPU processing available." << std::endl;
+#endif
+        
+        if (selectedDevice == -1) {
+            std::cout << "Currently selected: Device -1 (CPU)" << std::endl;
+        }
+    }
+    
+    // Cleanup GPU resources
+    static void CleanupGPU() {
+#ifdef USE_CUDA
+        if (useGPU) {
+            CudaHashCalculator::Cleanup();
+        }
+#endif
+        useGPU = false;
+        selectedDevice = -1;
+        gpuInitialized = false;
+    }
+    
+    // Determine if file should be processed on GPU
+    static bool ShouldUseGPU(size_t fileSize) {
+        return useGPU && fileSize >= gpuMinFileSize;
+    }
+    
     static std::string CalculateMD5(const std::vector<BYTE>& data) {
         HCRYPTPROV hProv = 0;
         HCRYPTHASH hHash = 0;
@@ -376,8 +531,36 @@ public:
         return ss.str();
     }
     
-    // Generic hash calculation dispatcher
+    // Generic hash calculation dispatcher with GPU acceleration
     static std::string CalculateHash(const std::vector<BYTE>& data, const std::string& algorithm) {
+        // Initialize GPU if not already done
+        if (!gpuInitialized) {
+            InitializeGPU(-2); // Use auto-selection
+        }
+        
+        // Try GPU acceleration for supported algorithms and large files
+        if (ShouldUseGPU(data.size())) {
+#ifdef USE_CUDA
+            std::vector<unsigned char> gpu_data(data.begin(), data.end());
+            
+            if (algorithm == "MD5") {
+                std::string result = CudaHashCalculator::CalculateMD5_GPU(gpu_data);
+                if (!result.empty()) return result;
+            } else if (algorithm == "SHA1") {
+                std::string result = CudaHashCalculator::CalculateSHA1_GPU(gpu_data);
+                if (!result.empty()) return result;
+            } else if (algorithm == "SHA256") {
+                std::string result = CudaHashCalculator::CalculateSHA256_GPU(gpu_data);
+                if (!result.empty()) return result;
+            } else if (algorithm == "CRC32") {
+                std::string result = CudaHashCalculator::CalculateCRC32_GPU(gpu_data);
+                if (!result.empty()) return result;
+            }
+            // Fall back to CPU if GPU fails
+#endif
+        }
+        
+        // CPU fallback
         if (algorithm == "MD5") {
             return CalculateMD5(data);
         } else if (algorithm == "SHA1") {
@@ -919,6 +1102,15 @@ public:
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Threads: " << numThreads << std::endl;
         
+        // Display device status
+        if (!gpuInitialized) {
+            InitializeGPU(-2); // Use auto-selection
+        }
+        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
+        if (useGPU) {
+            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
+        }
+        
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
             for (size_t i = 0; i < allowedExtensions.size(); i++) {
@@ -1155,6 +1347,15 @@ public:
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
+        
+        // Display device status
+        if (!gpuInitialized) {
+            InitializeGPU(-2); // Use auto-selection
+        }
+        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
+        if (useGPU) {
+            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
+        }
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -1582,6 +1783,15 @@ public:
         std::cout << "Threads: " << numThreads << std::endl;
         std::cout << "Batch size: " << batchSize << std::endl;
         
+        // Display device status
+        if (!gpuInitialized) {
+            InitializeGPU(-2); // Use auto-selection
+        }
+        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
+        if (useGPU) {
+            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
+        }
+        
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
             for (size_t i = 0; i < allowedExtensions.size(); i++) {
@@ -1801,6 +2011,12 @@ public:
 // Static member definition
 const char FileRenamerCLI::HEX_CHARS[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
 
+// GPU-related static member definitions
+bool FileRenamerCLI::gpuInitialized = false;
+bool FileRenamerCLI::useGPU = false;
+size_t FileRenamerCLI::gpuMinFileSize = 4096;
+int FileRenamerCLI::selectedDevice = -1;
+
 void PrintUsage() {
     std::cout << "File Batch Renamer Tool" << std::endl;
     std::cout << "=========================================" << std::endl;
@@ -1817,6 +2033,8 @@ void PrintUsage() {
     std::cout << "  -y, --yes               Auto-confirm without user interaction" << std::endl;
     std::cout << "  -t, --threads <n>       Number of processing threads [default: auto-detect]" << std::endl;
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
+    std::cout << "  -d, --device <id|cpu|auto> Device to use: -1 or 'cpu' for CPU, 0,1,2... for GPU, 'auto' for best available" << std::endl;
+    std::cout << "                          Use 'list' to show available devices [default: auto]" << std::endl;
     std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
     std::cout << "  --multi-thread          Use multi-threaded processing [default]" << std::endl;
     std::cout << "  --batch-mode            Use batch processing mode (best for large datasets)" << std::endl;
@@ -1831,9 +2049,29 @@ void PrintUsage() {
     std::cout << "Additional Options:" << std::endl;
     std::cout << "  --ultra-fast            Use ultra-fast processing mode with thread pool" << std::endl;
     std::cout << std::endl;
+#ifdef USE_CUDA
+    std::cout << "Device Support:" << std::endl;
+    std::cout << "  This version includes CUDA GPU acceleration support" << std::endl;
+    std::cout << "  CPU (Device -1): Always available, multi-threaded processing" << std::endl;
+    std::cout << "  GPU (Device 0+): CUDA-capable devices for large files (>4KB)" << std::endl;
+    std::cout << "  Supported GPU algorithms: MD5, SHA1, SHA256, CRC32" << std::endl;
+    std::cout << "  Auto-selection chooses best available device by default" << std::endl;
+    std::cout << std::endl;
+#else
+    std::cout << "Device Support:" << std::endl;
+    std::cout << "  CPU processing only (CUDA support not compiled)" << std::endl;
+    std::cout << "  All devices selections will use CPU processing" << std::endl;
+    std::cout << std::endl;
+#endif
     std::cout << "Examples:" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles                              # Multi-threaded preview with auto-detected threads" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles                              # Auto-select best available device" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -x jpg,png -t 8              # Use 8 threads for jpg/png files" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d list                      # List all available devices" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d auto                      # Auto-select best device" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d cpu                       # Force CPU processing" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d -1                        # Force CPU processing (alternative)" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d 0                         # Use GPU device 0" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles -d 1 -a SHA256               # Use GPU device 1 with SHA256" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles --batch-mode -b 50            # Batch mode with 50 files per batch" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles --single-thread               # Original single-threaded mode" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -e -t 16           # Execute SHA1 renaming with 16 threads, recursive" << std::endl;
@@ -1873,6 +2111,7 @@ int main(int argc, char* argv[]) {
     
     std::string directory;
     std::string algorithm = "MD5";
+    std::string deviceSelection = "auto"; // auto, cpu, list, or device ID
     bool recursive = false;
     bool dryRun = true;
     bool showHelp = false;
@@ -1929,6 +2168,23 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: Invalid batch size: " << batchSize << std::endl;
                 return 1;
             }
+        } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
+            deviceSelection = argv[++i];
+            // Validate device selection
+            if (deviceSelection == "list") {
+                // List devices and exit
+                FileRenamerCLI::ListAvailableDevices();
+                return 0;
+            } else if (deviceSelection != "auto" && deviceSelection != "cpu") {
+                // Check if it's a valid device ID (including -1 for CPU)
+                char* endPtr;
+                long deviceId = std::strtol(deviceSelection.c_str(), &endPtr, 10);
+                if (*endPtr != '\0' || deviceId < -1) {
+                    std::cerr << "Error: Invalid device specification: " << deviceSelection << std::endl;
+                    std::cerr << "Use 'auto', 'cpu', 'list', -1 (CPU), or a GPU device ID (0, 1, 2, ...)" << std::endl;
+                    return 1;
+                }
+            }
         } else if ((arg == "-x" || arg == "--extensions") && i + 1 < argc) {
             std::string extensionsStr = argv[++i];
             allowedExtensions = ParseExtensions(extensionsStr);
@@ -1955,6 +2211,20 @@ int main(int argc, char* argv[]) {
         PrintUsage();
         return 1;
     }
+    
+    // Initialize processing device with device selection
+    std::cout << "Initializing File Renamer Tool..." << std::endl;
+    int selectedDeviceId = -2; // Default to auto
+    
+    if (deviceSelection == "cpu") {
+        selectedDeviceId = -1; // Force CPU
+    } else if (deviceSelection == "auto") {
+        selectedDeviceId = -2; // Auto-select best device
+    } else {
+        selectedDeviceId = std::atoi(deviceSelection.c_str()); // Specific device ID (including -1 for CPU)
+    }
+    
+    bool gpuAvailable = FileRenamerCLI::InitializeGPU(selectedDeviceId);
     
     if (!dryRun) {
         std::cout << "WARNING: This will permanently rename files!" << std::endl;
@@ -1993,6 +2263,9 @@ int main(int argc, char* argv[]) {
             FileRenamerCLI::ProcessDirectoryUltraFast(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads);
             break;
     }
+    
+    // Cleanup GPU resources
+    FileRenamerCLI::CleanupGPU();
     
     return 0;
 }
