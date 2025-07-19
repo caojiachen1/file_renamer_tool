@@ -358,6 +358,7 @@ jobs:
       shell: cmd
       run: |
         echo 开始构建项目...
+        setlocal enabledelayedexpansion
         
         set CUDA_AVAILABLE=${{ steps.verify_cuda.outputs.cuda_available }}
         set BUILD_TYPE=${{ steps.verify_cuda.outputs.build_type }}
@@ -366,41 +367,49 @@ jobs:
           echo 🚀 编译CUDA版本 ^(启用GPU加速^)...
           echo 配置CMake ^(启用CUDA^)...
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
+          set CMAKE_EXIT_CODE=!errorlevel!
           
-          if !errorlevel! neq 0 (
+          if !CMAKE_EXIT_CODE! neq 0 (
             echo ⚠ CMake配置失败，尝试回退到CPU模式...
             echo 重新配置CMake ^(CPU模式^)...
             cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
+            set CMAKE_EXIT_CODE=!errorlevel!
             
-            if !errorlevel! neq 0 (
+            if !CMAKE_EXIT_CODE! neq 0 (
               echo ❌ CMake配置完全失败！
-              exit /b !errorlevel!
+              exit /b !CMAKE_EXIT_CODE!
             )
             
             echo ✓ 成功回退到CPU模式
             set BUILD_TYPE=cpu
+          ) else (
+            echo ✓ CUDA版本CMake配置成功
           )
         ) else (
           echo 🔧 编译CPU版本 ^(标准模式^)...
           echo 配置CMake ^(CPU模式^)...
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
+          set CMAKE_EXIT_CODE=!errorlevel!
           
-          if !errorlevel! neq 0 (
+          if !CMAKE_EXIT_CODE! neq 0 (
             echo ❌ CMake配置失败！
-            exit /b !errorlevel!
+            exit /b !CMAKE_EXIT_CODE!
+          ) else (
+            echo ✓ CPU版本CMake配置成功
           )
         )
         
         echo 编译项目...
         cmake --build build --config Release --verbose
-        if !errorlevel! neq 0 (
+        set BUILD_EXIT_CODE=!errorlevel!
+        if !BUILD_EXIT_CODE! neq 0 (
           echo ❌ 构建失败！
-          exit /b !errorlevel!
+          exit /b !BUILD_EXIT_CODE!
         )
         
         echo 复制可执行文件到根目录...
-        copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
         if exist "build\Release\file_renamer_cli.exe" (
+          copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
           if "%BUILD_TYPE%"=="cuda" (
             echo ✅ CUDA版本构建完成！
           ) else (
@@ -408,6 +417,8 @@ jobs:
           )
         ) else (
           echo ❌ 未找到构建产物！
+          echo 查找可能的构建产物位置...
+          dir /s build\*.exe 2>nul
           exit /b 1
         )
         
