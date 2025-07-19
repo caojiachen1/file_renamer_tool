@@ -38,6 +38,8 @@ jobs:
       uses: lukka/get-cmake@latest
       
     - name: Setup CUDA 12.8
+      id: setup_cuda
+      continue-on-error: true
       uses: Jimver/cuda-toolkit@v0.2.26
       with:
         cuda: '12.8.0'
@@ -47,41 +49,79 @@ jobs:
         # log-file-suffix: 'cuda-install.log'
         
     - name: Verify CUDA installation
+      id: verify_cuda
       shell: pwsh
       run: |
         Write-Host "检查CUDA安装..."
+        $cuda_available = $false
+        
         try {
-          $nvcc_version = nvcc --version
-          Write-Host "NVCC版本信息:"
-          Write-Host $nvcc_version
+          # 检查CUDA setup步骤是否成功
+          $cuda_setup_result = "${{ steps.setup_cuda.outcome }}"
+          Write-Host "CUDA安装步骤结果: $cuda_setup_result"
+          
+          if ($cuda_setup_result -eq "failure") {
+            Write-Host "⚠ CUDA安装失败，将使用CPU模式"
+            Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
+            Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
+            return
+          }
+          
+          # 验证NVCC命令
+          $nvcc_version = nvcc --version 2>$null
+          if ($LASTEXITCODE -eq 0 -and $nvcc_version) {
+            Write-Host "✓ NVCC版本信息:"
+            Write-Host $nvcc_version
+            $cuda_available = $true
+          } else {
+            Write-Host "⚠ NVCC命令不可用"
+            Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
+            Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
+            return
+          }
           
           # 检查CUDA路径
           if ($env:CUDA_PATH) {
-            Write-Host "CUDA_PATH: $env:CUDA_PATH"
+            Write-Host "✓ CUDA_PATH: $env:CUDA_PATH"
+            
+            # 检查关键文件
+            $cuda_lib = "$env:CUDA_PATH\lib\x64"
+            if (Test-Path $cuda_lib) {
+              Write-Host "✓ CUDA库目录存在: $cuda_lib"
+            } else {
+              Write-Host "⚠ CUDA库目录不存在: $cuda_lib"
+              $cuda_available = $false
+            }
+            
+            $cuda_include = "$env:CUDA_PATH\include"
+            if (Test-Path $cuda_include) {
+              Write-Host "✓ CUDA头文件目录存在: $cuda_include"
+            } else {
+              Write-Host "⚠ CUDA头文件目录不存在: $cuda_include"
+              $cuda_available = $false
+            }
+          } else {
+            Write-Host "⚠ CUDA_PATH环境变量未设置"
+            $cuda_available = $false
           }
           
           if ($env:CUDA_HOME) {
-            Write-Host "CUDA_HOME: $env:CUDA_HOME"
-          }
-          
-          # 检查关键文件
-          $cuda_lib = "$env:CUDA_PATH\lib\x64"
-          if (Test-Path $cuda_lib) {
-            Write-Host "✓ CUDA库目录存在: $cuda_lib"
-          } else {
-            Write-Host "⚠ CUDA库目录不存在: $cuda_lib"
-          }
-          
-          $cuda_include = "$env:CUDA_PATH\include"
-          if (Test-Path $cuda_include) {
-            Write-Host "✓ CUDA头文件目录存在: $cuda_include"
-          } else {
-            Write-Host "⚠ CUDA头文件目录不存在: $cuda_include"
+            Write-Host "✓ CUDA_HOME: $env:CUDA_HOME"
           }
           
         } catch {
-          Write-Error "CUDA验证失败: $($_.Exception.Message)"
-          exit 1
+          Write-Host "⚠ CUDA验证过程中出现异常: $($_.Exception.Message)"
+          $cuda_available = $false
+        }
+        
+        if ($cuda_available) {
+          Write-Host "🎉 CUDA环境验证成功，将编译CUDA版本"
+          Write-Output "cuda_available=true" >> $env:GITHUB_OUTPUT
+          Write-Output "build_type=cuda" >> $env:GITHUB_OUTPUT
+        } else {
+          Write-Host "⚠ CUDA环境不完整，将回退到CPU模式编译"
+          Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
+          Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
         }
       
     - name: Get version from tag or input
@@ -317,28 +357,57 @@ jobs:
     - name: Build project
       shell: cmd
       run: |
-        echo 开始构建项目 (启用CUDA 12.8)...
+        echo 开始构建项目...
         
-        echo 配置CMake (启用CUDA)...
-        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
-        if %errorlevel% neq 0 (
-          echo CMake配置失败！
-          exit /b %errorlevel%
+        set CUDA_AVAILABLE=${{ steps.verify_cuda.outputs.cuda_available }}
+        set BUILD_TYPE=${{ steps.verify_cuda.outputs.build_type }}
+        
+        if "%CUDA_AVAILABLE%"=="true" (
+          echo 🚀 编译CUDA版本 ^(启用GPU加速^)...
+          echo 配置CMake ^(启用CUDA^)...
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
+          
+          if !errorlevel! neq 0 (
+            echo ⚠ CMake配置失败，尝试回退到CPU模式...
+            echo 重新配置CMake ^(CPU模式^)...
+            cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
+            
+            if !errorlevel! neq 0 (
+              echo ❌ CMake配置完全失败！
+              exit /b !errorlevel!
+            )
+            
+            echo ✓ 成功回退到CPU模式
+            set BUILD_TYPE=cpu
+          )
+        ) else (
+          echo 🔧 编译CPU版本 ^(标准模式^)...
+          echo 配置CMake ^(CPU模式^)...
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
+          
+          if !errorlevel! neq 0 (
+            echo ❌ CMake配置失败！
+            exit /b !errorlevel!
+          )
         )
         
         echo 编译项目...
         cmake --build build --config Release --verbose
-        if %errorlevel% neq 0 (
-          echo 构建失败！
-          exit /b %errorlevel%
+        if !errorlevel! neq 0 (
+          echo ❌ 构建失败！
+          exit /b !errorlevel!
         )
         
         echo 复制可执行文件到根目录...
         copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
         if exist "build\Release\file_renamer_cli.exe" (
-          echo ✓ CUDA版本构建完成！
+          if "%BUILD_TYPE%"=="cuda" (
+            echo ✅ CUDA版本构建完成！
+          ) else (
+            echo ✅ CPU版本构建完成！
+          )
         ) else (
-          echo ✗ 未找到构建产物！
+          echo ❌ 未找到构建产物！
           exit /b 1
         )
         
@@ -373,42 +442,80 @@ jobs:
         }
         
     - name: Prepare release assets
+      id: prepare_release_assets
       shell: pwsh
       run: |
-        Write-Host "准备发布文件 (CUDA版本)..."
+        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
+        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
+        
+        if ($cuda_available -eq "true") {
+          Write-Host "准备发布文件 (CUDA版本)..."
+          $build_description = "cuda12.8"
+          $performance_note = "GPU加速版本"
+        } else {
+          Write-Host "准备发布文件 (CPU版本)..."
+          $build_description = "cpu"
+          $performance_note = "标准CPU版本"
+        }
         
         # 创建发布目录
         New-Item -ItemType Directory -Force -Path "release-assets"
         
-        # 复制主要可执行文件 (CUDA版本)
+        # 复制主要可执行文件
         $version = "${{ steps.version.outputs.version }}"
-        $release_name = "file_renamer_cli_$($version)_windows_x64_cuda12.8.exe"
+        $release_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
         Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
         
-        Write-Host "发布文件准备完成："
+        Write-Host "发布文件准备完成 ($performance_note)："
         Get-ChildItem "release-assets" | ForEach-Object {
           Write-Host "  - $($_.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
         }
+        
+        # 输出构建类型供后续步骤使用
+        Write-Output "build_description=$build_description" >> $env:GITHUB_OUTPUT
+        Write-Output "performance_note=$performance_note" >> $env:GITHUB_OUTPUT
         
     - name: Create release notes
       shell: pwsh
       run: |
         $version = "${{ steps.version.outputs.version }}"
+        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
+        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
         
         # 获取最新的commit信息
         $commit_message = git log -1 --pretty=format:"%s"
         $commit_body = git log -1 --pretty=format:"%b"
         $commit_hash = git log -1 --pretty=format:"%h"
         
-        # 创建简洁的发布说明
+        # 创建发布说明
         $content = @()
-        $content += "## 📦 File Renamer CLI Tool $version (CUDA 12.8)"
-        $content += ""
-        $content += "🚀 **GPU加速版本** - 支持NVIDIA GPU并行计算，显著提升大文件批量重命名性能"
+        
+        if ($cuda_available -eq "true") {
+          $content += "## 📦 File Renamer CLI Tool $version (CUDA 12.8)"
+          $content += ""
+          $content += "🚀 **GPU加速版本** - 支持NVIDIA GPU并行计算，显著提升大文件批量重命名性能"
+          $gpu_requirements = @(
+            "- Windows 10/11 (x64)"
+            "- NVIDIA GPU (支持CUDA 12.8)"
+            "- 兼容的显卡驱动程序"
+          )
+          $fallback_note = "**注意：** 如果系统没有兼容的NVIDIA GPU，程序会自动回退到CPU模式运行"
+        } else {
+          $content += "## 📦 File Renamer CLI Tool $version (CPU版本)"
+          $content += ""
+          $content += "🔧 **标准CPU版本** - 兼容所有Windows系统，稳定可靠的文件重命名工具"
+          $gpu_requirements = @(
+            "- Windows 10/11 (x64)"
+            "- 无需额外GPU要求"
+          )
+          $fallback_note = "**说明：** 此版本为CPU优化版本，在所有Windows系统上都能稳定运行"
+        }
+        
         $content += ""
         
         # 添加commit信息
         if ($commit_message) {
+          $content += "## 更新内容"
           $content += "- $commit_message"
           if ($commit_body -and $commit_body.Trim() -ne "") {
             $commit_body.Split("`n") | ForEach-Object {
@@ -423,7 +530,7 @@ jobs:
         }
         
         # 添加使用说明
-        $content += "使用方法"
+        $content += "## 使用方法"
         $content += ""
         $content += "**预览模式**"
         $content += '```cmd'
@@ -440,15 +547,13 @@ jobs:
         $content += 'file_renamer.exe --help'
         $content += '```'
         $content += ""
-        $content += "系统要求"
-        $content += "- Windows 10/11 (x64)"
-        $content += "- NVIDIA GPU (可选，用于GPU加速)"
-        $content += "- CUDA 12.8兼容的显卡驱动"
+        $content += "## 系统要求"
+        $gpu_requirements | ForEach-Object { $content += $_ }
         $content += ""
-        $content += "**注意：** 如果系统没有兼容的NVIDIA GPU，程序会自动回退到CPU模式运行"
+        $content += $fallback_note
         
         $content | Out-File "release-notes.md" -Encoding UTF8
-        Write-Host "发布说明已生成"
+        Write-Host "发布说明已生成 ($build_type 版本)"
         
     - name: Create Release
       id: create_release
@@ -527,7 +632,8 @@ jobs:
       shell: pwsh
       run: |
         $version = "${{ steps.version.outputs.version }}"
-        $asset_name = "file_renamer_cli_$($version)_windows_x64_cuda12.8.exe"
+        $build_description = "${{ steps.prepare_release_assets.outputs.build_description }}"
+        $asset_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
         $asset_path = "release-assets/$asset_name"
         $upload_url = "${{ steps.create_release.outputs.upload_url }}"
         
@@ -606,13 +712,24 @@ jobs:
       run: |
         $created = "${{ steps.create_release.outputs.created }}"
         $action = if ($created -eq "true") { "创建" } else { "复用" }
+        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
+        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
+        $performance_note = "${{ steps.prepare_release_assets.outputs.performance_note }}"
         
-        Write-Host "🎉 CUDA版本构建和发布完成！"
+        Write-Host "🎉 构建和发布完成！"
         Write-Host ""
         Write-Host "📋 构建摘要:"
         Write-Host "  版本: ${{ steps.version.outputs.version }}"
-        Write-Host "  CUDA版本: 12.8"
-        Write-Host "  GPU加速: 已启用"
+        
+        if ($cuda_available -eq "true") {
+          Write-Host "  构建类型: CUDA加速版本"
+          Write-Host "  CUDA版本: 12.8"
+          Write-Host "  GPU加速: 已启用"
+        } else {
+          Write-Host "  构建类型: CPU标准版本"
+          Write-Host "  GPU加速: 不可用/已跳过"
+        }
+        
         Write-Host "  Release操作: $action"
         Write-Host "  发布URL: ${{ steps.create_release.outputs.html_url }}"
         Write-Host ""
@@ -624,7 +741,15 @@ jobs:
         Write-Host "🔗 下载链接:"
         Write-Host "  Release页面: ${{ steps.create_release.outputs.html_url }}"
         Write-Host ""
-        Write-Host "⚡ 性能提升:"
-        Write-Host "  • GPU并行哈希计算"
-        Write-Host "  • 支持Maxwell到Blackwell架构"
-        Write-Host "  • 自动CPU/GPU模式切换"
+        
+        if ($cuda_available -eq "true") {
+          Write-Host "⚡ 性能特性:"
+          Write-Host "  • GPU并行哈希计算"
+          Write-Host "  • 支持Maxwell到Blackwell架构"
+          Write-Host "  • 自动CPU/GPU模式切换"
+        } else {
+          Write-Host "🔧 版本特性:"
+          Write-Host "  • 全系统兼容性"
+          Write-Host "  • 稳定的CPU处理"
+          Write-Host "  • 无额外依赖要求"
+        }
