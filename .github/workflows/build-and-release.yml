@@ -331,28 +331,75 @@ jobs:
       run: |
         $version = "${{ steps.version.outputs.version }}"
         
-        # 检查标签是否已存在
-        $existing_tag = git tag -l $version
-        if ($existing_tag) {
-          Write-Host "标签 $version 已存在，复用现有标签"
-          # 检查远程是否也存在该标签
-          $remote_tag = git ls-remote --tags origin $version
-          if (-not $remote_tag) {
-            Write-Host "远程不存在标签 $version，推送到远程"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git push origin $version
+        Write-Host "处理标签: $version"
+        
+        # 配置git用户信息
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        
+        # 检查远程标签是否存在
+        $remote_tag = git ls-remote --tags origin $version 2>$null
+        if ($remote_tag) {
+          Write-Host "✓ 远程标签 $version 已存在，直接复用"
+          
+          # 检查本地标签是否存在，如果不存在则从远程获取
+          $local_tag = git tag -l $version
+          if (-not $local_tag) {
+            Write-Host "本地标签不存在，从远程获取..."
+            git fetch origin "refs/tags/$version`:refs/tags/$version" 2>$null
+            Write-Host "✓ 已从远程获取标签 $version"
           } else {
-            Write-Host "远程也存在标签 $version，直接复用"
+            Write-Host "✓ 本地标签 $version 也存在"
           }
         } else {
-          Write-Host "创建新标签: $version"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag $version
-          git push origin $version
-          Write-Host "标签 $version 已创建并推送"
+          Write-Host "远程标签 $version 不存在，准备创建..."
+          
+          # 检查本地标签是否存在
+          $local_tag = git tag -l $version
+          if ($local_tag) {
+            Write-Host "本地标签 $version 已存在，推送到远程..."
+            try {
+              git push origin $version
+              Write-Host "✓ 标签 $version 已推送到远程"
+            } catch {
+              Write-Host "⚠ 推送标签时出现错误，可能标签已在远程存在"
+              # 重新检查远程标签
+              $remote_check = git ls-remote --tags origin $version 2>$null
+              if ($remote_check) {
+                Write-Host "✓ 确认远程标签现在存在，继续处理"
+              } else {
+                Write-Error "推送标签失败且远程仍不存在标签"
+                exit 1
+              }
+            }
+          } else {
+            Write-Host "创建新标签: $version"
+            git tag $version
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✓ 本地标签 $version 创建成功"
+              
+              try {
+                git push origin $version
+                Write-Host "✓ 标签 $version 已推送到远程"
+              } catch {
+                Write-Host "⚠ 推送标签时出现错误，可能是并发创建导致"
+                # 重新检查远程标签
+                $remote_check = git ls-remote --tags origin $version 2>$null
+                if ($remote_check) {
+                  Write-Host "✓ 确认远程标签现在存在，继续处理"
+                } else {
+                  Write-Error "推送标签失败且远程仍不存在标签"
+                  exit 1
+                }
+              }
+            } else {
+              Write-Error "创建本地标签失败"
+              exit 1
+            }
+          }
         }
+        
+        Write-Host "✅ 标签处理完成: $version"
         
     - name: Build project
       shell: cmd
