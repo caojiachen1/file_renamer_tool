@@ -9,30 +9,51 @@
 bool CudaHashCalculator::initialized = false;
 GPUInfo CudaHashCalculator::gpuInfo;
 bool CudaHashCalculator::isCudaAvailable = false;
+std::mutex CudaHashCalculator::s_mutex;
 void* CudaHashCalculator::d_input_pool = nullptr;
 void* CudaHashCalculator::d_output_pool = nullptr;
 size_t CudaHashCalculator::pool_size = 0;
+cudaStream_t CudaHashCalculator::s_stream1 = nullptr;
+cudaStream_t CudaHashCalculator::s_stream2 = nullptr;
+cudaEvent_t  CudaHashCalculator::s_evtPtrReady = nullptr;
+unsigned char** CudaHashCalculator::s_d_inputs = nullptr;
+unsigned int**  CudaHashCalculator::s_d_outputs = nullptr;
+size_t*         CudaHashCalculator::s_d_lengths = nullptr;
+int             CudaHashCalculator::s_ptrCapacity = 0;
+unsigned char*  CudaHashCalculator::s_h_all_inputs = nullptr;
+unsigned int*   CudaHashCalculator::s_h_all_outputs = nullptr;
+unsigned char*  CudaHashCalculator::s_d_all_inputs = nullptr;
+unsigned int*   CudaHashCalculator::s_d_all_outputs = nullptr;
+size_t          CudaHashCalculator::s_h_in_capacity = 0;
+size_t          CudaHashCalculator::s_h_out_capacity = 0;
+size_t          CudaHashCalculator::s_d_in_capacity = 0;
+size_t          CudaHashCalculator::s_d_out_capacity = 0;
 
 // MD5 constants and functions for GPU
 __constant__ unsigned int d_md5_k[64];
 __constant__ unsigned int d_md5_r[64];
 
-__device__ unsigned int md5_f(unsigned int x, unsigned int y, unsigned int z, int round) {
+__device__ __forceinline__ unsigned int md5_f(unsigned int x, unsigned int y, unsigned int z, int round) {
     if (round < 16) return (x & y) | (~x & z);
     if (round < 32) return (z & x) | (~z & y);
     if (round < 48) return x ^ y ^ z;
     return y ^ (x | ~z);
 }
 
-__device__ unsigned int md5_g(int round) {
+__device__ __forceinline__ unsigned int md5_g(int round) {
     if (round < 16) return round;
     if (round < 32) return (5 * round + 1) % 16;
     if (round < 48) return (3 * round + 5) % 16;
     return (7 * round) % 16;
 }
 
-__device__ unsigned int rotate_left(unsigned int value, int shift) {
-    return (value << shift) | (value >> (32 - shift));
+__device__ __forceinline__ unsigned int rotate_left(unsigned int value, int shift) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 320)
+    // Use hardware funnel shift when available for better performance
+    return __funnelshift_l(value, value, shift & 31);
+#else
+    return (value << (shift & 31)) | (value >> ((32 - (shift & 31)) & 31));
+#endif
 }
 
 // MD5 device function implementation
@@ -56,7 +77,7 @@ __device__ void md5_compute(const unsigned char* input, unsigned int* output, si
                     w[i] |= ((unsigned int)input[byte_idx]) << (8 * j);
                 } else if (byte_idx == length) {
                     w[i] |= 0x80 << (8 * j);
-                } else if (chunk_start + 56 <= byte_idx && byte_idx < chunk_start + 64) {
+                } else if ((chunk_start + 64 == padded_len) && (chunk_start + 56 <= byte_idx && byte_idx < chunk_start + 64)) {
                     int bit_pos = (byte_idx - chunk_start - 56) * 8;
                     w[i] |= ((unsigned int)(bit_len >> bit_pos)) << (8 * j);
                 }
@@ -101,8 +122,8 @@ __global__ void md5_kernel(const unsigned char* input, unsigned int* output, siz
 }
 
 // Batch MD5 kernel
-__global__ void md5_batch_kernel(const unsigned char** inputs, unsigned int** outputs, 
-                               const size_t* lengths, int batch_size) {
+__global__ void md5_batch_kernel(const unsigned char* const* __restrict__ inputs, unsigned int* const* __restrict__ outputs, 
+                               const size_t* __restrict__ lengths, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= batch_size) return;
@@ -115,7 +136,7 @@ __constant__ unsigned int d_crc32_table[256];
 
 // CRC32 kernel implementation
 // CRC32 device function implementation
-__device__ void crc32_compute(const unsigned char* input, unsigned int* output, size_t length) {
+__device__ __forceinline__ void crc32_compute(const unsigned char* input, unsigned int* output, size_t length) {
     unsigned int crc = 0xFFFFFFFF;
     
     for (size_t i = 0; i < length; i++) {
@@ -134,8 +155,8 @@ __global__ void crc32_kernel(const unsigned char* input, unsigned int* output, s
 }
 
 // Batch CRC32 kernel
-__global__ void crc32_batch_kernel(const unsigned char** inputs, unsigned int** outputs, 
-                                 const size_t* lengths, int batch_size) {
+__global__ void crc32_batch_kernel(const unsigned char* const* __restrict__ inputs, unsigned int* const* __restrict__ outputs, 
+                                 const size_t* __restrict__ lengths, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= batch_size) return;
@@ -146,7 +167,7 @@ __global__ void crc32_batch_kernel(const unsigned char** inputs, unsigned int** 
 // SHA1 constants
 __constant__ unsigned int d_sha1_k[4] = {0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6};
 
-__device__ unsigned int sha1_f(unsigned int x, unsigned int y, unsigned int z, int round) {
+__device__ __forceinline__ unsigned int sha1_f(unsigned int x, unsigned int y, unsigned int z, int round) {
     if (round < 20) return (x & y) | (~x & z);
     if (round < 40) return x ^ y ^ z;
     if (round < 60) return (x & y) | (x & z) | (y & z);
@@ -164,20 +185,32 @@ __device__ void sha1_compute(const unsigned char* input, unsigned int* output, s
     // Process message in chunks of 64 bytes
     for (size_t chunk_start = 0; chunk_start < padded_len; chunk_start += 64) {
         unsigned int w[80] = {0};
-        
-        // Fill first 16 words
-        for (int i = 0; i < 16; i++) {
-            for (int j = 0; j < 4; j++) {
-                size_t byte_idx = chunk_start + i * 4 + (3 - j); // Big-endian
-                if (byte_idx < length) {
-                    w[i] |= ((unsigned int)input[byte_idx]) << (8 * j);
-                } else if (byte_idx == length) {
-                    w[i] |= 0x80 << (8 * j);
-                } else if (chunk_start + 56 <= byte_idx && byte_idx < chunk_start + 64) {
-                    int bit_pos = (63 - byte_idx + chunk_start) * 8;
-                    w[i] |= ((unsigned int)(bit_len >> bit_pos)) << (8 * j);
-                }
+        unsigned char chunk[64] = {0};
+
+        // Fill chunk with message/padding
+        for (int i = 0; i < 64; ++i) {
+            size_t idx = chunk_start + i;
+            if (idx < length) {
+                chunk[i] = input[idx];
+            } else if (idx == length) {
+                chunk[i] = 0x80;
+            } else {
+                // remains 0
             }
+        }
+        // Write 64-bit big-endian length in the final chunk
+        if (chunk_start + 64 == padded_len) {
+            for (int k = 0; k < 8; ++k) {
+                chunk[56 + k] = (unsigned char)((bit_len >> (8 * (7 - k))) & 0xFF);
+            }
+        }
+
+        // Convert to big-endian 32-bit words
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((unsigned int)chunk[i * 4 + 0] << 24) |
+                   ((unsigned int)chunk[i * 4 + 1] << 16) |
+                   ((unsigned int)chunk[i * 4 + 2] << 8)  |
+                   ((unsigned int)chunk[i * 4 + 3] << 0);
         }
         
         // Extend the sixteen 32-bit words into eighty 32-bit words
@@ -222,8 +255,8 @@ __global__ void sha1_kernel(const unsigned char* input, unsigned int* output, si
 }
 
 // Batch SHA1 kernel
-__global__ void sha1_batch_kernel(const unsigned char** inputs, unsigned int** outputs, 
-                                const size_t* lengths, int batch_size) {
+__global__ void sha1_batch_kernel(const unsigned char* const* __restrict__ inputs, unsigned int* const* __restrict__ outputs, 
+                                const size_t* __restrict__ lengths, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= batch_size) return;
@@ -243,27 +276,27 @@ __constant__ unsigned int d_sha256_k[64] = {
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
 };
 
-__device__ unsigned int sha256_ch(unsigned int x, unsigned int y, unsigned int z) {
+__device__ __forceinline__ unsigned int sha256_ch(unsigned int x, unsigned int y, unsigned int z) {
     return (x & y) ^ (~x & z);
 }
 
-__device__ unsigned int sha256_maj(unsigned int x, unsigned int y, unsigned int z) {
+__device__ __forceinline__ unsigned int sha256_maj(unsigned int x, unsigned int y, unsigned int z) {
     return (x & y) ^ (x & z) ^ (y & z);
 }
 
-__device__ unsigned int sha256_sigma0(unsigned int x) {
+__device__ __forceinline__ unsigned int sha256_sigma0(unsigned int x) {
     return rotate_left(x, 30) ^ rotate_left(x, 19) ^ rotate_left(x, 10);
 }
 
-__device__ unsigned int sha256_sigma1(unsigned int x) {
+__device__ __forceinline__ unsigned int sha256_sigma1(unsigned int x) {
     return rotate_left(x, 26) ^ rotate_left(x, 21) ^ rotate_left(x, 7);
 }
 
-__device__ unsigned int sha256_gamma0(unsigned int x) {
+__device__ __forceinline__ unsigned int sha256_gamma0(unsigned int x) {
     return rotate_left(x, 25) ^ rotate_left(x, 14) ^ (x >> 3);
 }
 
-__device__ unsigned int sha256_gamma1(unsigned int x) {
+__device__ __forceinline__ unsigned int sha256_gamma1(unsigned int x) {
     return rotate_left(x, 15) ^ rotate_left(x, 13) ^ (x >> 10);
 }
 
@@ -281,20 +314,32 @@ __device__ void sha256_compute(const unsigned char* input, unsigned int* output,
     // Process message in chunks of 64 bytes
     for (size_t chunk_start = 0; chunk_start < padded_len; chunk_start += 64) {
         unsigned int w[64] = {0};
-        
-        // Fill first 16 words
-        for (int i = 0; i < 16; i++) {
-            for (int j = 0; j < 4; j++) {
-                size_t byte_idx = chunk_start + i * 4 + (3 - j); // Big-endian
-                if (byte_idx < length) {
-                    w[i] |= ((unsigned int)input[byte_idx]) << (8 * j);
-                } else if (byte_idx == length) {
-                    w[i] |= 0x80 << (8 * j);
-                } else if (chunk_start + 56 <= byte_idx && byte_idx < chunk_start + 64) {
-                    int bit_pos = (63 - byte_idx + chunk_start) * 8;
-                    w[i] |= ((unsigned int)(bit_len >> bit_pos)) << (8 * j);
-                }
+        unsigned char chunk[64] = {0};
+
+        // Fill chunk with message/padding
+        for (int i = 0; i < 64; ++i) {
+            size_t idx = chunk_start + i;
+            if (idx < length) {
+                chunk[i] = input[idx];
+            } else if (idx == length) {
+                chunk[i] = 0x80;
+            } else {
+                // remains 0
             }
+        }
+        // Write 64-bit big-endian length in the final chunk
+        if (chunk_start + 64 == padded_len) {
+            for (int k = 0; k < 8; ++k) {
+                chunk[56 + k] = (unsigned char)((bit_len >> (8 * (7 - k))) & 0xFF);
+            }
+        }
+
+        // Convert to big-endian 32-bit words
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((unsigned int)chunk[i * 4 + 0] << 24) |
+                   ((unsigned int)chunk[i * 4 + 1] << 16) |
+                   ((unsigned int)chunk[i * 4 + 2] << 8)  |
+                   ((unsigned int)chunk[i * 4 + 3] << 0);
         }
         
         // Extend the sixteen 32-bit words into sixty-four 32-bit words
@@ -339,8 +384,8 @@ __global__ void sha256_kernel(const unsigned char* input, unsigned int* output, 
 }
 
 // Batch SHA256 kernel
-__global__ void sha256_batch_kernel(const unsigned char** inputs, unsigned int** outputs, 
-                                  const size_t* lengths, int batch_size) {
+__global__ void sha256_batch_kernel(const unsigned char* const* __restrict__ inputs, unsigned int* const* __restrict__ outputs, 
+                                  const size_t* __restrict__ lengths, int batch_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= batch_size) return;
@@ -367,7 +412,10 @@ bool CudaHashCalculator::Initialize() {
     gpuInfo.devices.resize(deviceCount);
     
     for (int i = 0; i < deviceCount; i++) {
-        CUDA_CHECK(cudaGetDeviceProperties(&gpuInfo.devices[i], i));
+        if (!CUDA_TRY(cudaGetDeviceProperties(&gpuInfo.devices[i], i))) {
+            isCudaAvailable = false;
+            return false;
+        }
     }
     
     // Select best device
@@ -409,18 +457,44 @@ bool CudaHashCalculator::Initialize() {
     }
     
     // Copy constants to GPU
-    CUDA_CHECK(cudaMemcpyToSymbol(d_md5_k, md5_k, sizeof(md5_k)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_md5_r, md5_r, sizeof(md5_r)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_crc32_table, crc32_table, sizeof(crc32_table)));
+    if (!CUDA_TRY(cudaMemcpyToSymbol(d_md5_k, md5_k, sizeof(md5_k)))) return false;
+    if (!CUDA_TRY(cudaMemcpyToSymbol(d_md5_r, md5_r, sizeof(md5_r)))) return false;
+    if (!CUDA_TRY(cudaMemcpyToSymbol(d_crc32_table, crc32_table, sizeof(crc32_table)))) return false;
     
     // Allocate GPU memory pools
     if (!AllocateGPUMemoryPools()) {
         return false;
     }
     
+    // Create persistent streams (non-blocking)
+    if (!CUDA_TRY(cudaStreamCreateWithFlags(&s_stream1, cudaStreamNonBlocking))) {
+        FreeGPUMemoryPools();
+        return false;
+    }
+    if (!CUDA_TRY(cudaStreamCreateWithFlags(&s_stream2, cudaStreamNonBlocking))) {
+        cudaStreamDestroy(s_stream1); s_stream1 = nullptr;
+        FreeGPUMemoryPools();
+        return false;
+    }
+
+    // Create persistent event (no timing)
+    if (!CUDA_TRY(cudaEventCreateWithFlags(&s_evtPtrReady, cudaEventDisableTiming))) {
+        cudaStreamDestroy(s_stream2); s_stream2 = nullptr;
+        cudaStreamDestroy(s_stream1); s_stream1 = nullptr;
+        FreeGPUMemoryPools();
+        return false;
+    }
+
     isCudaAvailable = true;
     initialized = true;
-    
+
+    // Run a quick self-test to validate correctness
+    if (!SelfTest()) {
+        std::cerr << "CUDA self-test failed. Disabling GPU acceleration." << std::endl;
+        Cleanup();
+        return false;
+    }
+
     std::cout << "CUDA initialized successfully!" << std::endl;
     PrintGPUInfo();
     
@@ -430,11 +504,67 @@ bool CudaHashCalculator::Initialize() {
 void CudaHashCalculator::Cleanup() {
     if (!initialized) return;
     
+    if (s_evtPtrReady) { cudaEventDestroy(s_evtPtrReady); s_evtPtrReady = nullptr; }
+    if (s_stream2) { cudaStreamDestroy(s_stream2); s_stream2 = nullptr; }
+    if (s_stream1) { cudaStreamDestroy(s_stream1); s_stream1 = nullptr; }
+    if (s_d_lengths) { cudaFree(s_d_lengths); s_d_lengths = nullptr; }
+    if (s_d_outputs) { cudaFree(s_d_outputs); s_d_outputs = nullptr; }
+    if (s_d_inputs) { cudaFree(s_d_inputs); s_d_inputs = nullptr; }
+    if (s_d_all_outputs) { cudaFree(s_d_all_outputs); s_d_all_outputs = nullptr; s_d_out_capacity = 0; }
+    if (s_d_all_inputs) { cudaFree(s_d_all_inputs); s_d_all_inputs = nullptr; s_d_in_capacity = 0; }
+    if (s_h_all_outputs) { cudaFreeHost(s_h_all_outputs); s_h_all_outputs = nullptr; s_h_out_capacity = 0; }
+    if (s_h_all_inputs) { cudaFreeHost(s_h_all_inputs); s_h_all_inputs = nullptr; s_h_in_capacity = 0; }
+    s_ptrCapacity = 0;
+
     FreeGPUMemoryPools();
     cudaDeviceReset();
     
     initialized = false;
     isCudaAvailable = false;
+}
+
+bool CudaHashCalculator::EnsureHostBatchBufferCapacity(size_t inBytes, size_t outBytes) {
+    if (!isCudaAvailable) return false;
+    bool ok = true;
+    // Input pinned host buffer: prefer write-combined for H2D throughput (CPU write-only, then DMA)
+    if (inBytes > s_h_in_capacity) {
+        // geometric growth with a reasonable floor to reduce realloc frequency
+        size_t newCap = s_h_in_capacity ? s_h_in_capacity * 2 : 256 * 1024; // 256KB min
+        if (newCap < inBytes) newCap = inBytes;
+        if (s_h_all_inputs) { cudaFreeHost(s_h_all_inputs); s_h_all_inputs = nullptr; s_h_in_capacity = 0; }
+        ok = CUDA_TRY(cudaHostAlloc(&s_h_all_inputs, newCap, cudaHostAllocWriteCombined));
+        if (!ok) return false;
+        s_h_in_capacity = newCap;
+    }
+    // Output pinned host buffer: default pinned memory (CPU will read results)
+    if (outBytes > s_h_out_capacity) {
+        size_t newCap = s_h_out_capacity ? s_h_out_capacity * 2 : 64 * 1024; // 64KB min
+        if (newCap < outBytes) newCap = outBytes;
+        if (s_h_all_outputs) { cudaFreeHost(s_h_all_outputs); s_h_all_outputs = nullptr; s_h_out_capacity = 0; }
+        ok = CUDA_TRY(cudaHostAlloc(&s_h_all_outputs, newCap, cudaHostAllocDefault));
+        if (!ok) return false;
+        s_h_out_capacity = newCap;
+    }
+    return true;
+}
+
+bool CudaHashCalculator::EnsureDeviceBatchBufferCapacity(size_t inBytes, size_t outBytes) {
+    if (!isCudaAvailable) return false;
+    if (inBytes > s_d_in_capacity) {
+        size_t newCap = s_d_in_capacity ? s_d_in_capacity * 2 : 256 * 1024; // 256KB min
+        if (newCap < inBytes) newCap = inBytes;
+        if (s_d_all_inputs) { cudaFree(s_d_all_inputs); s_d_all_inputs = nullptr; s_d_in_capacity = 0; }
+        if (!CUDA_TRY(cudaMalloc(&s_d_all_inputs, newCap))) return false;
+        s_d_in_capacity = newCap;
+    }
+    if (outBytes > s_d_out_capacity) {
+        size_t newCap = s_d_out_capacity ? s_d_out_capacity * 2 : 64 * 1024; // 64KB min
+        if (newCap < outBytes) newCap = outBytes;
+        if (s_d_all_outputs) { cudaFree(s_d_all_outputs); s_d_all_outputs = nullptr; s_d_out_capacity = 0; }
+        if (!CUDA_TRY(cudaMalloc(&s_d_all_outputs, newCap))) return false;
+        s_d_out_capacity = newCap;
+    }
+    return true;
 }
 
 bool CudaHashCalculator::SelectBestDevice() {
@@ -454,7 +584,9 @@ bool CudaHashCalculator::SelectBestDevice() {
         }
     }
     
-    CUDA_CHECK(cudaSetDevice(bestDevice));
+    if (!CUDA_TRY(cudaSetDevice(bestDevice))) {
+        return false;
+    }
     gpuInfo.selectedDevice = bestDevice;
     gpuInfo.isAvailable = true;
     
@@ -483,7 +615,9 @@ size_t CudaHashCalculator::GetAvailableGPUMemory() {
     if (!isCudaAvailable) return 0;
     
     size_t free_mem, total_mem;
-    CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
+    if (!CUDA_TRY(cudaMemGetInfo(&free_mem, &total_mem))) {
+        return 0;
+    }
     return free_mem;
 }
 
@@ -550,188 +684,853 @@ std::string CudaHashCalculator::BytesToHexString(const unsigned char* data, size
     return ss.str();
 }
 
+bool CudaHashCalculator::EnsureDevicePointerCapacity(int n) {
+    if (!isCudaAvailable) return false;
+    if (n <= s_ptrCapacity && s_d_inputs && s_d_outputs && s_d_lengths) return true;
+
+    // Free existing if any
+    if (s_d_lengths) { cudaFree(s_d_lengths); s_d_lengths = nullptr; }
+    if (s_d_outputs) { cudaFree(s_d_outputs); s_d_outputs = nullptr; }
+    if (s_d_inputs)  { cudaFree(s_d_inputs);  s_d_inputs  = nullptr; }
+    s_ptrCapacity = 0;
+
+    if (n <= 0) return true;
+
+    // Allocate with headroom to reduce reallocations
+    int newCap = s_ptrCapacity ? std::max(n, s_ptrCapacity * 2) : std::max(n, 64);
+    if (!CUDA_TRY(cudaMalloc(&s_d_inputs,  sizeof(unsigned char*) * newCap))) return false;
+    if (!CUDA_TRY(cudaMalloc(&s_d_outputs, sizeof(unsigned int*)  * newCap))) { cudaFree(s_d_inputs); s_d_inputs = nullptr; return false; }
+    if (!CUDA_TRY(cudaMalloc(&s_d_lengths, sizeof(size_t) * newCap)))       { cudaFree(s_d_outputs); s_d_outputs = nullptr; cudaFree(s_d_inputs); s_d_inputs = nullptr; return false; }
+
+    s_ptrCapacity = newCap;
+    return true;
+}
+
+bool CudaHashCalculator::SelfTest() {
+    // Known test vector: empty string
+    const std::vector<unsigned char> empty;
+    // MD5("") = d41d8cd98f00b204e9800998ecf8427e
+    // SHA1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+    // SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    // CRC32("") = 00000000
+    // Our GPU path returns empty string for empty input by design; test small payload instead
+
+    const char* msg = "abc"; // common test vector
+    std::vector<unsigned char> data(reinterpret_cast<const unsigned char*>(msg),
+                                    reinterpret_cast<const unsigned char*>(msg) + 3);
+
+    // Expected values
+    const std::string md5_exp = "900150983cd24fb0d6963f7d28e17f72";
+    const std::string sha1_exp = "a9993e364706816aba3e25717850c26c9cd0d89d";
+    const std::string sha256_exp = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const std::string crc32_exp = "352441c2"; // standard IEEE CRC-32 of "abc"
+
+    std::string md5 = CalculateMD5_GPU(data);
+    std::string sha1 = CalculateSHA1_GPU(data);
+    std::string sha256 = CalculateSHA256_GPU(data);
+    std::string crc32 = CalculateCRC32_GPU(data);
+
+    auto tolower_str = [](std::string s){
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c){ return std::tolower(c); });
+        return s;
+    };
+
+    if (tolower_str(md5) != md5_exp) {
+        std::cerr << "MD5 self-test failed: got " << md5 << ", expected " << md5_exp << std::endl;
+        return false;
+    }
+    if (tolower_str(sha1) != sha1_exp) {
+        std::cerr << "SHA1 self-test failed: got " << sha1 << ", expected " << sha1_exp << std::endl;
+        return false;
+    }
+    if (tolower_str(sha256) != sha256_exp) {
+        std::cerr << "SHA256 self-test failed: got " << sha256 << ", expected " << sha256_exp << std::endl;
+        return false;
+    }
+    if (tolower_str(crc32) != crc32_exp) {
+        std::cerr << "CRC32 self-test failed: got " << crc32 << ", expected " << crc32_exp << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
 // GPU hash calculation implementations
 std::string CudaHashCalculator::CalculateMD5_GPU(const std::vector<unsigned char>& data) {
-    if (!isCudaAvailable || data.empty()) return "";
-    
-    // Allocate GPU memory
-    unsigned char* d_input;
-    unsigned int* d_output;
-    
-    CUDA_CHECK(cudaMalloc(&d_input, data.size()));
-    CUDA_CHECK(cudaMalloc(&d_output, 16)); // MD5 is 16 bytes
-    
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_input, data.data(), data.size(), cudaMemcpyHostToDevice));
-    
-    // Launch kernel
-    md5_kernel<<<1, 1>>>(d_input, d_output, data.size());
-    CUDA_CHECK_KERNEL();
-    
-    // Copy result back
-    unsigned int result[4];
-    CUDA_CHECK(cudaMemcpy(result, d_output, 16, cudaMemcpyDeviceToHost));
-    
-    // Convert to hex string
-    std::string hex_result = BytesToHexString(reinterpret_cast<unsigned char*>(result), 16);
-    
-    // Cleanup
-    cudaFree(d_input);
-    cudaFree(d_output);
-    
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!isCudaAvailable) return "";
+    if (data.empty()) {
+        // MD5("")
+        return std::string("d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    const size_t inBytes = data.size();
+    const size_t outBytes = 16; // 4 words
+
+    // Ensure persistent pinned host/device buffers
+    if (!EnsureHostBatchBufferCapacity(inBytes, outBytes)) return "";
+    if (!EnsureDeviceBatchBufferCapacity(inBytes, outBytes)) return "";
+
+    // Copy input into pinned host buffer and H2D async on stream1
+    std::memcpy(s_h_all_inputs, data.data(), inBytes);
+    if (!CUDA_TRY(cudaMemcpyAsync(s_d_all_inputs, s_h_all_inputs, inBytes, cudaMemcpyHostToDevice, s_stream1))) return "";
+
+    // Launch kernel (single item)
+    md5_kernel<<<1, 1, 0, s_stream1>>>(s_d_all_inputs, s_d_all_outputs, inBytes);
+    if (!CUDA_TRY_KERNEL_NOSYNC()) return "";
+
+    // D2H async and synchronize stream1
+    if (!CUDA_TRY(cudaMemcpyAsync(s_h_all_outputs, s_d_all_outputs, outBytes, cudaMemcpyDeviceToHost, s_stream1))) return "";
+    if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) return "";
+
+    // Convert to hex string (MD5 uses byte order of output)
+    std::string hex_result = BytesToHexString(reinterpret_cast<unsigned char*>(s_h_all_outputs), 16);
     return hex_result;
 }
 
 std::string CudaHashCalculator::CalculateSHA1_GPU(const std::vector<unsigned char>& data) {
-    if (!isCudaAvailable || data.empty()) return "";
-    
-    // Allocate GPU memory
-    unsigned char* d_input;
-    unsigned int* d_output;
-    
-    CUDA_CHECK(cudaMalloc(&d_input, data.size()));
-    CUDA_CHECK(cudaMalloc(&d_output, 20)); // SHA1 is 20 bytes
-    
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_input, data.data(), data.size(), cudaMemcpyHostToDevice));
-    
-    // Launch kernel
-    sha1_kernel<<<1, 1>>>(d_input, d_output, data.size());
-    CUDA_CHECK_KERNEL();
-    
-    // Copy result back
-    unsigned int result[5];
-    CUDA_CHECK(cudaMemcpy(result, d_output, 20, cudaMemcpyDeviceToHost));
-    
-    // Convert to hex string (big-endian)
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!isCudaAvailable) return "";
+    if (data.empty()) {
+        // SHA1("")
+        return std::string("da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    }
+
+    const size_t inBytes = data.size();
+    const size_t outWords = 5;
+    const size_t outBytes = outWords * sizeof(unsigned int);
+
+    if (!EnsureHostBatchBufferCapacity(inBytes, outBytes)) return "";
+    if (!EnsureDeviceBatchBufferCapacity(inBytes, outBytes)) return "";
+
+    std::memcpy(s_h_all_inputs, data.data(), inBytes);
+    if (!CUDA_TRY(cudaMemcpyAsync(s_d_all_inputs, s_h_all_inputs, inBytes, cudaMemcpyHostToDevice, s_stream1))) return "";
+
+    sha1_kernel<<<1, 1, 0, s_stream1>>>(s_d_all_inputs, s_d_all_outputs, inBytes);
+    if (!CUDA_TRY_KERNEL_NOSYNC()) return "";
+
+    if (!CUDA_TRY(cudaMemcpyAsync(s_h_all_outputs, s_d_all_outputs, outBytes, cudaMemcpyDeviceToHost, s_stream1))) return "";
+    if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) return "";
+
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
-    for (int i = 0; i < 5; i++) {
-        // Convert to big-endian for display
-        unsigned int be_val = ((result[i] & 0xFF) << 24) | 
-                              ((result[i] & 0xFF00) << 8) |
-                              ((result[i] & 0xFF0000) >> 8) |
-                              ((result[i] & 0xFF000000) >> 24);
-        ss << std::setw(8) << be_val;
-    }
-    
-    // Cleanup
-    cudaFree(d_input);
-    cudaFree(d_output);
-    
+    for (int i = 0; i < static_cast<int>(outWords); i++) ss << std::setw(8) << s_h_all_outputs[i];
     return ss.str();
 }
 
 std::string CudaHashCalculator::CalculateSHA256_GPU(const std::vector<unsigned char>& data) {
-    if (!isCudaAvailable || data.empty()) return "";
-    
-    // Allocate GPU memory
-    unsigned char* d_input;
-    unsigned int* d_output;
-    
-    CUDA_CHECK(cudaMalloc(&d_input, data.size()));
-    CUDA_CHECK(cudaMalloc(&d_output, 32)); // SHA256 is 32 bytes
-    
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_input, data.data(), data.size(), cudaMemcpyHostToDevice));
-    
-    // Launch kernel
-    sha256_kernel<<<1, 1>>>(d_input, d_output, data.size());
-    CUDA_CHECK_KERNEL();
-    
-    // Copy result back
-    unsigned int result[8];
-    CUDA_CHECK(cudaMemcpy(result, d_output, 32, cudaMemcpyDeviceToHost));
-    
-    // Convert to hex string (big-endian)
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!isCudaAvailable) return "";
+    if (data.empty()) {
+        // SHA256("")
+        return std::string("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    const size_t inBytes = data.size();
+    const size_t outWords = 8;
+    const size_t outBytes = outWords * sizeof(unsigned int);
+
+    if (!EnsureHostBatchBufferCapacity(inBytes, outBytes)) return "";
+    if (!EnsureDeviceBatchBufferCapacity(inBytes, outBytes)) return "";
+
+    std::memcpy(s_h_all_inputs, data.data(), inBytes);
+    if (!CUDA_TRY(cudaMemcpyAsync(s_d_all_inputs, s_h_all_inputs, inBytes, cudaMemcpyHostToDevice, s_stream1))) return "";
+
+    sha256_kernel<<<1, 1, 0, s_stream1>>>(s_d_all_inputs, s_d_all_outputs, inBytes);
+    if (!CUDA_TRY_KERNEL_NOSYNC()) return "";
+
+    if (!CUDA_TRY(cudaMemcpyAsync(s_h_all_outputs, s_d_all_outputs, outBytes, cudaMemcpyDeviceToHost, s_stream1))) return "";
+    if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) return "";
+
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
-    for (int i = 0; i < 8; i++) {
-        // Convert to big-endian for display
-        unsigned int be_val = ((result[i] & 0xFF) << 24) | 
-                              ((result[i] & 0xFF00) << 8) |
-                              ((result[i] & 0xFF0000) >> 8) |
-                              ((result[i] & 0xFF000000) >> 24);
-        ss << std::setw(8) << be_val;
-    }
-    
-    // Cleanup
-    cudaFree(d_input);
-    cudaFree(d_output);
-    
+    for (int i = 0; i < static_cast<int>(outWords); i++) ss << std::setw(8) << s_h_all_outputs[i];
     return ss.str();
 }
 
 std::string CudaHashCalculator::CalculateCRC32_GPU(const std::vector<unsigned char>& data) {
-    if (!isCudaAvailable || data.empty()) return "";
-    
-    // Allocate GPU memory
-    unsigned char* d_input;
-    unsigned int* d_output;
-    
-    CUDA_CHECK(cudaMalloc(&d_input, data.size()));
-    CUDA_CHECK(cudaMalloc(&d_output, 4)); // CRC32 is 4 bytes
-    
-    // Copy data to GPU
-    CUDA_CHECK(cudaMemcpy(d_input, data.data(), data.size(), cudaMemcpyHostToDevice));
-    
-    // Launch kernel
-    crc32_kernel<<<1, 1>>>(d_input, d_output, data.size());
-    CUDA_CHECK_KERNEL();
-    
-    // Copy result back
-    unsigned int result;
-    CUDA_CHECK(cudaMemcpy(&result, d_output, 4, cudaMemcpyDeviceToHost));
-    
-    // Convert to hex string
+    std::lock_guard<std::mutex> lock(s_mutex);
+    if (!isCudaAvailable) return "";
+    if (data.empty()) {
+        // CRC32("")
+        return std::string("00000000");
+    }
+
+    const size_t inBytes = data.size();
+    const size_t outWords = 1;
+    const size_t outBytes = outWords * sizeof(unsigned int);
+
+    if (!EnsureHostBatchBufferCapacity(inBytes, outBytes)) return "";
+    if (!EnsureDeviceBatchBufferCapacity(inBytes, outBytes)) return "";
+
+    std::memcpy(s_h_all_inputs, data.data(), inBytes);
+    if (!CUDA_TRY(cudaMemcpyAsync(s_d_all_inputs, s_h_all_inputs, inBytes, cudaMemcpyHostToDevice, s_stream1))) return "";
+
+    crc32_kernel<<<1, 1, 0, s_stream1>>>(s_d_all_inputs, s_d_all_outputs, inBytes);
+    if (!CUDA_TRY_KERNEL_NOSYNC()) return "";
+
+    if (!CUDA_TRY(cudaMemcpyAsync(s_h_all_outputs, s_d_all_outputs, outBytes, cudaMemcpyDeviceToHost, s_stream1))) return "";
+    if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) return "";
+
     std::stringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(8) << result;
-    
-    // Cleanup
-    cudaFree(d_input);
-    cudaFree(d_output);
-    
+    ss << std::hex << std::setfill('0') << std::setw(8) << s_h_all_outputs[0];
     return ss.str();
 }
 
 // Batch processing functions (simplified implementation)
 std::vector<std::string> CudaHashCalculator::CalculateBatchMD5_GPU(const std::vector<std::vector<unsigned char>>& dataList) {
+    std::lock_guard<std::mutex> lock(s_mutex);
     std::vector<std::string> results;
-    
-    // For simplicity, process one by one (can be optimized for true batch processing)
-    for (const auto& data : dataList) {
-        results.push_back(CalculateMD5_GPU(data));
+    if (!isCudaAvailable || dataList.empty()) return results;
+
+    const int n = static_cast<int>(dataList.size());
+    results.resize(n);
+
+    // Pre-declare host pointer arrays and launch config to avoid goto crossing initialization
+    std::vector<unsigned char*> h_inputs(n, nullptr);
+    std::vector<unsigned int*> h_outputs_ptrs(n, nullptr);
+    // Predeclare compact arrays to avoid goto-bypassed initialization
+    int m = 0;
+    std::vector<unsigned char*> h_inputs_c;
+    std::vector<unsigned int*> h_outputs_ptrs_c;
+    std::vector<size_t> lengths_c;
+    std::vector<size_t> offsets_c;
+    dim3 block;
+    dim3 grid;
+    // Predeclare device pointers to avoid goto-bypassed initialization warnings
+    unsigned char* d_all_inputs = nullptr;
+    unsigned int* d_all_outputs = nullptr;
+    unsigned char** d_inputs = nullptr;
+    unsigned int** d_outputs = nullptr;
+    size_t* d_lengths = nullptr;
+    // Predeclare split variables to avoid goto-bypassed initialization warnings
+    int mid;
+    int cnt1;
+    int cnt2;
+    size_t bytes1;
+    size_t bytes2;
+    const size_t outWordsPerItem = 4;
+    size_t outBytes1;
+    size_t outBytes2;
+    size_t startOffset2;
+
+    // Handle empty inputs: directly set standard digest for empty string
+    int nonEmptyCount = 0;
+    std::vector<int> nonEmptyIdx;
+    std::vector<size_t> lengths(n, 0);
+    std::vector<size_t> offsets(n, 0);
+    size_t totalBytes = 0;
+    for (int i = 0; i < n; ++i) {
+        lengths[i] = dataList[i].size();
+        if (lengths[i] == 0) {
+            results[i] = "d41d8cd98f00b204e9800998ecf8427e"; // MD5("")
+        } else {
+            offsets[i] = totalBytes;
+            totalBytes += lengths[i];
+            ++nonEmptyCount;
+            nonEmptyIdx.push_back(i);
+        }
     }
-    
+    if (nonEmptyCount == 0) return results;
+
+    // Ensure pinned host buffers
+    if (!EnsureHostBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 4 * n)) return results;
+    unsigned char* h_all_inputs = s_h_all_inputs;
+    unsigned int* h_all_outputs = s_h_all_outputs; // 4 words per MD5
+
+    // Pack inputs
+    for (int i = 0; i < n; ++i) {
+        if (lengths[i] > 0) {
+            memcpy(h_all_inputs + offsets[i], dataList[i].data(), lengths[i]);
+        }
+    }
+
+    bool ok = true;
+    bool started1 = false, started2 = false;
+    do {
+        // Ensure device buffers
+        if (!EnsureDeviceBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 4 * n)) { ok = false; break; }
+        d_all_inputs = s_d_all_inputs;
+        d_all_outputs = s_d_all_outputs;
+
+        if (!EnsureDevicePointerCapacity(n)) { ok = false; break; }
+        d_inputs = s_d_inputs; d_outputs = s_d_outputs; d_lengths = s_d_lengths;
+
+        // Build compact host arrays (only non-empty items)
+        m = nonEmptyCount;
+        h_inputs_c.resize(m, nullptr);
+        h_outputs_ptrs_c.resize(m, nullptr);
+        lengths_c.resize(m, 0);
+        offsets_c.resize(m, 0);
+        for (int j = 0; j < m; ++j) {
+            int i = nonEmptyIdx[j];
+            lengths_c[j] = lengths[i];
+            offsets_c[j] = offsets[i];
+            h_inputs_c[j] = d_all_inputs + offsets_c[j];
+            h_outputs_ptrs_c[j] = d_all_outputs + j * 4; // compact contiguous outputs
+        }
+
+        // Split work into two halves (bytes-balanced on compact arrays)
+        {
+            const size_t target = totalBytes / 2;
+            int splitIndex = m; // default: all in first half
+            for (int j = 0; j < m; ++j) {
+                if (offsets_c[j] >= target) { splitIndex = j; break; }
+            }
+            mid = splitIndex;
+        }
+        cnt1 = mid;
+        cnt2 = m - mid;
+        if (cnt1 > 0 && mid < m) {
+            bytes1 = offsets_c[mid];
+        } else if (cnt1 > 0 && mid == m) {
+            bytes1 = totalBytes;
+        } else {
+            bytes1 = 0;
+        }
+        startOffset2 = (mid < m) ? offsets_c[mid] : totalBytes;
+        bytes2 = totalBytes - startOffset2;
+        outBytes1 = outWordsPerItem * sizeof(unsigned int) * cnt1;
+        outBytes2 = outWordsPerItem * sizeof(unsigned int) * cnt2;
+
+        // Copy pointer arrays and lengths asynchronously on stream1, and fence with an event for stream2
+        if (!CUDA_TRY(cudaMemcpyAsync(d_inputs, h_inputs_c.data(), sizeof(unsigned char*) * m, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_outputs, h_outputs_ptrs_c.data(), sizeof(unsigned int*) * m, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_lengths, lengths_c.data(), sizeof(size_t) * m, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaEventRecord(s_evtPtrReady, s_stream1))) { ok = false; break; }
+        started1 = true;
+
+        // H2D for each half
+        if (cnt1 > 0 && bytes1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs, h_all_inputs, bytes1, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+            started1 = true;
+        }
+        if (cnt2 > 0 && bytes2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs + startOffset2, h_all_inputs + startOffset2, bytes2, cudaMemcpyHostToDevice, s_stream2))) { ok = false; break; }
+            started2 = true;
+        }
+
+        // Launch kernels per half
+        block = dim3(256);
+        if (cnt1 > 0) {
+            grid = dim3((cnt1 + block.x - 1) / block.x);
+            md5_batch_kernel<<<grid, block, 0, s_stream1>>>(const_cast<const unsigned char**>(d_inputs), const_cast<unsigned int**>(d_outputs), d_lengths, cnt1);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+        if (cnt2 > 0) {
+            grid = dim3((cnt2 + block.x - 1) / block.x);
+            // Ensure stream2 observes pointer arrays/lengths updates
+            if (!CUDA_TRY(cudaStreamWaitEvent(s_stream2, s_evtPtrReady, 0))) { ok = false; break; }
+            md5_batch_kernel<<<grid, block, 0, s_stream2>>>(const_cast<const unsigned char**>(d_inputs + mid), const_cast<unsigned int**>(d_outputs + mid), d_lengths + mid, cnt2);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+
+        // D2H for each half
+        if (cnt1 > 0 && outBytes1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs, d_all_outputs, outBytes1, cudaMemcpyDeviceToHost, s_stream1))) { ok = false; break; }
+        }
+        if (cnt2 > 0 && outBytes2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs + outWordsPerItem * mid, d_all_outputs + outWordsPerItem * mid, outBytes2, cudaMemcpyDeviceToHost, s_stream2))) { ok = false; break; }
+        }
+
+        // Sync
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream2))) { ok = false; break; }
+
+        // Fill result strings
+        for (int j = 0; j < m; ++j) {
+            int i = nonEmptyIdx[j];
+            unsigned char* bytes = reinterpret_cast<unsigned char*>(h_all_outputs + j * 4);
+            results[i] = BytesToHexString(bytes, 16);
+        }
+    } while (false);
+
+    if (!ok) {
+        // Drain any started async ops to keep streams consistent for next calls
+        if (started1) cudaStreamSynchronize(s_stream1);
+        if (started2) cudaStreamSynchronize(s_stream2);
+    }
+
     return results;
 }
 
 std::vector<std::string> CudaHashCalculator::CalculateBatchSHA1_GPU(const std::vector<std::vector<unsigned char>>& dataList) {
+    std::lock_guard<std::mutex> lock(s_mutex);
     std::vector<std::string> results;
-    
-    for (const auto& data : dataList) {
-        results.push_back(CalculateSHA1_GPU(data));
+    if (!isCudaAvailable || dataList.empty()) return results;
+
+    const int n = static_cast<int>(dataList.size());
+    results.resize(n);
+
+    // Pre-declare to avoid goto crossing initialization
+    std::vector<unsigned char*> h_inputs(n, nullptr);
+    std::vector<unsigned int*> h_outputs_ptrs(n, nullptr);
+    // Predeclare compact arrays to avoid goto-bypassed initialization
+    int m1 = 0;
+    std::vector<unsigned char*> h_inputs_c1;
+    std::vector<unsigned int*> h_outputs_ptrs_c1;
+    std::vector<size_t> lengths_c1;
+    std::vector<size_t> offsets_c1;
+    dim3 block;
+    dim3 grid;
+    // Predeclare split variables
+    int mid1;
+    int cnt1_1;
+    int cnt2_1;
+    size_t bytes1_1;
+    size_t bytes2_1;
+    const size_t sha1Words = 5;
+    size_t outBytes1_1;
+    size_t outBytes2_1;
+    size_t startOffset2_1;
+
+    int nonEmptyCount = 0;
+    std::vector<int> nonEmptyIdx1;
+    std::vector<size_t> lengths(n, 0);
+    std::vector<size_t> offsets(n, 0);
+    size_t totalBytes = 0;
+    for (int i = 0; i < n; ++i) {
+        lengths[i] = dataList[i].size();
+        if (lengths[i] == 0) {
+            // SHA1("") standard digest
+            results[i] = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        } else {
+            offsets[i] = totalBytes;
+            totalBytes += lengths[i];
+            ++nonEmptyCount;
+            nonEmptyIdx1.push_back(i);
+        }
     }
-    
+    if (nonEmptyCount == 0) return results;
+
+    if (!EnsureDeviceBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 5 * n)) return results;
+    unsigned char* h_all_inputs = s_h_all_inputs;
+    unsigned int* h_all_outputs = s_h_all_outputs; // 5 words per SHA1
+    for (int i = 0; i < n; ++i) if (lengths[i] > 0) memcpy(h_all_inputs + offsets[i], dataList[i].data(), lengths[i]);
+
+    unsigned char* d_all_inputs = nullptr;
+    unsigned int* d_all_outputs = nullptr;
+    unsigned char** d_inputs = nullptr;
+    unsigned int** d_outputs = nullptr;
+    size_t* d_lengths = nullptr;
+
+    bool ok = true; bool started1 = false, started2 = false;
+    do {
+        if (!EnsureDeviceBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 5 * n)) { ok = false; break; }
+        d_all_inputs = s_d_all_inputs;
+        d_all_outputs = s_d_all_outputs;
+        m1 = nonEmptyCount;
+        if (!EnsureDevicePointerCapacity(m1)) { ok = false; break; }
+        d_inputs = s_d_inputs; d_outputs = s_d_outputs; d_lengths = s_d_lengths;
+
+        // Build compact arrays for non-empty entries
+        h_inputs_c1.resize(m1, nullptr);
+        h_outputs_ptrs_c1.resize(m1, nullptr);
+        lengths_c1.resize(m1, 0);
+        offsets_c1.resize(m1, 0);
+        for (int j = 0; j < m1; ++j) {
+            int i = nonEmptyIdx1[j];
+            lengths_c1[j] = lengths[i];
+            offsets_c1[j] = offsets[i];
+            h_inputs_c1[j] = d_all_inputs + offsets_c1[j];
+            h_outputs_ptrs_c1[j] = d_all_outputs + j * 5;
+        }
+
+        // Compute split variables
+        {
+            const size_t target1 = totalBytes / 2;
+            int splitIndex1 = m1;
+            for (int j = 0; j < m1; ++j) {
+                if (offsets_c1[j] >= target1) { splitIndex1 = j; break; }
+            }
+            mid1 = splitIndex1;
+        }
+        cnt1_1 = mid1;
+        cnt2_1 = m1 - mid1;
+        if (cnt1_1 > 0 && mid1 < m1) {
+            bytes1_1 = offsets_c1[mid1];
+        } else if (cnt1_1 > 0 && mid1 == m1) {
+            bytes1_1 = totalBytes;
+        } else {
+            bytes1_1 = 0;
+        }
+        startOffset2_1 = (mid1 < m1) ? offsets_c1[mid1] : totalBytes;
+        bytes2_1 = totalBytes - startOffset2_1;
+        outBytes1_1 = sha1Words * sizeof(unsigned int) * cnt1_1;
+        outBytes2_1 = sha1Words * sizeof(unsigned int) * cnt2_1;
+
+        // Copy pointer arrays and lengths asynchronously on stream1, and fence with an event for stream2
+        if (!CUDA_TRY(cudaMemcpyAsync(d_inputs, h_inputs_c1.data(), sizeof(unsigned char*) * m1, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_outputs, h_outputs_ptrs_c1.data(), sizeof(unsigned int*) * m1, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_lengths, lengths_c1.data(), sizeof(size_t) * m1, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaEventRecord(s_evtPtrReady, s_stream1))) { ok = false; break; }
+        started1 = true;
+
+        if (cnt1_1 > 0 && bytes1_1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs, h_all_inputs, bytes1_1, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+            started1 = true;
+        }
+        if (cnt2_1 > 0 && bytes2_1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs + startOffset2_1, h_all_inputs + startOffset2_1, bytes2_1, cudaMemcpyHostToDevice, s_stream2))) { ok = false; break; }
+            started2 = true;
+        }
+
+        block = dim3(256);
+        if (cnt1_1 > 0) {
+            grid = dim3((cnt1_1 + block.x - 1) / block.x);
+            sha1_batch_kernel<<<grid, block, 0, s_stream1>>>(const_cast<const unsigned char**>(d_inputs), const_cast<unsigned int**>(d_outputs), d_lengths, cnt1_1);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+        if (cnt2_1 > 0) {
+            grid = dim3((cnt2_1 + block.x - 1) / block.x);
+            // Ensure stream2 observes pointer arrays/lengths updates
+            if (!CUDA_TRY(cudaStreamWaitEvent(s_stream2, s_evtPtrReady, 0))) { ok = false; break; }
+            sha1_batch_kernel<<<grid, block, 0, s_stream2>>>(const_cast<const unsigned char**>(d_inputs + mid1), const_cast<unsigned int**>(d_outputs + mid1), d_lengths + mid1, cnt2_1);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+
+        if (cnt1_1 > 0 && outBytes1_1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs, d_all_outputs, outBytes1_1, cudaMemcpyDeviceToHost, s_stream1))) { ok = false; break; }
+        }
+        if (cnt2_1 > 0 && outBytes2_1 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs + sha1Words * mid1, d_all_outputs + sha1Words * mid1, outBytes2_1, cudaMemcpyDeviceToHost, s_stream2))) { ok = false; break; }
+        }
+
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream2))) { ok = false; break; }
+
+        for (int j = 0; j < m1; ++j) {
+            int i = nonEmptyIdx1[j];
+            std::stringstream ss;
+            ss << std::hex << std::setfill('0');
+            for (int w = 0; w < 5; ++w) ss << std::setw(8) << h_all_outputs[j * 5 + w];
+            results[i] = ss.str();
+        }
+    } while(false);
+
+    if (!ok) {
+        if (started1) cudaStreamSynchronize(s_stream1);
+        if (started2) cudaStreamSynchronize(s_stream2);
+    }
+
     return results;
 }
 
 std::vector<std::string> CudaHashCalculator::CalculateBatchSHA256_GPU(const std::vector<std::vector<unsigned char>>& dataList) {
+    std::lock_guard<std::mutex> lock(s_mutex);
     std::vector<std::string> results;
-    
-    for (const auto& data : dataList) {
-        results.push_back(CalculateSHA256_GPU(data));
+    if (!isCudaAvailable || dataList.empty()) return results;
+
+    const int n = static_cast<int>(dataList.size());
+    results.resize(n);
+
+    // Pre-declare to avoid goto crossing initialization
+    std::vector<unsigned char*> h_inputs(n, nullptr);
+    std::vector<unsigned int*> h_outputs_ptrs(n, nullptr);
+    // Predeclare compact arrays to avoid goto-bypassed initialization
+    int m2 = 0;
+    std::vector<unsigned char*> h_inputs_c2;
+    std::vector<unsigned int*> h_outputs_ptrs_c2;
+    std::vector<size_t> lengths_c2;
+    std::vector<size_t> offsets_c2;
+    dim3 block;
+    dim3 grid;
+    // Predeclare split variables
+    int mid2;
+    int cnt1_2;
+    int cnt2_2;
+    size_t bytes1_2;
+    size_t bytes2_2;
+    const size_t sha256Words = 8;
+    size_t outBytes1_2;
+    size_t outBytes2_2;
+    size_t startOffset2_2;
+
+    int nonEmptyCount = 0;
+    std::vector<int> nonEmptyIdx2;
+    std::vector<size_t> lengths(n, 0);
+    std::vector<size_t> offsets(n, 0);
+    size_t totalBytes = 0;
+    for (int i = 0; i < n; ++i) {
+        lengths[i] = dataList[i].size();
+        if (lengths[i] == 0) {
+            // SHA256("") standard digest
+            results[i] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        } else {
+            offsets[i] = totalBytes;
+            totalBytes += lengths[i];
+            ++nonEmptyCount;
+            nonEmptyIdx2.push_back(i);
+        }
     }
-    
+    if (nonEmptyCount == 0) return results;
+
+    if (!EnsureHostBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 8 * n)) return results;
+    unsigned char* h_all_inputs = s_h_all_inputs;
+    unsigned int* h_all_outputs = s_h_all_outputs; // 8 words per SHA256
+    for (int i = 0; i < n; ++i) if (lengths[i] > 0) memcpy(h_all_inputs + offsets[i], dataList[i].data(), lengths[i]);
+
+    unsigned char* d_all_inputs = nullptr;
+    unsigned int* d_all_outputs = nullptr;
+    unsigned char** d_inputs = nullptr;
+    unsigned int** d_outputs = nullptr;
+    size_t* d_lengths = nullptr;
+
+    bool ok = true; bool started1 = false, started2 = false;
+    do {
+        if (!EnsureDeviceBatchBufferCapacity(totalBytes, sizeof(unsigned int) * 8 * n)) { ok = false; break; }
+        d_all_inputs = s_d_all_inputs;
+        d_all_outputs = s_d_all_outputs;
+        m2 = nonEmptyCount;
+        if (!EnsureDevicePointerCapacity(m2)) { ok = false; break; }
+        d_inputs = s_d_inputs; d_outputs = s_d_outputs; d_lengths = s_d_lengths;
+
+        // Build compact arrays for non-empty entries
+        h_inputs_c2.resize(m2, nullptr);
+        h_outputs_ptrs_c2.resize(m2, nullptr);
+        lengths_c2.resize(m2, 0);
+        offsets_c2.resize(m2, 0);
+        for (int j = 0; j < m2; ++j) {
+            int i = nonEmptyIdx2[j];
+            lengths_c2[j] = lengths[i];
+            offsets_c2[j] = offsets[i];
+            h_inputs_c2[j] = d_all_inputs + offsets_c2[j];
+            h_outputs_ptrs_c2[j] = d_all_outputs + j * 8;
+        }
+
+        if (!CUDA_TRY(cudaMemcpyAsync(d_inputs, h_inputs_c2.data(), sizeof(unsigned char*) * m2, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_outputs, h_outputs_ptrs_c2.data(), sizeof(unsigned int*) * m2, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_lengths, lengths_c2.data(), sizeof(size_t) * m2, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaEventRecord(s_evtPtrReady, s_stream1))) { ok = false; break; }
+        started1 = true;
+
+        {
+            const size_t target2 = totalBytes / 2;
+            int splitIndex2 = m2;
+            for (int j = 0; j < m2; ++j) {
+                if (offsets_c2[j] >= target2) { splitIndex2 = j; break; }
+            }
+            mid2 = splitIndex2;
+        }
+        cnt1_2 = mid2;
+        cnt2_2 = m2 - mid2;
+        if (cnt1_2 > 0 && mid2 < m2) {
+            bytes1_2 = offsets_c2[mid2];
+        } else if (cnt1_2 > 0 && mid2 == m2) {
+            bytes1_2 = totalBytes;
+        } else {
+            bytes1_2 = 0;
+        }
+        startOffset2_2 = (mid2 < m2) ? offsets_c2[mid2] : totalBytes;
+        bytes2_2 = totalBytes - startOffset2_2;
+
+        if (cnt1_2 > 0 && bytes1_2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs, h_all_inputs, bytes1_2, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+            started1 = true;
+        }
+        if (cnt2_2 > 0 && bytes2_2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs + startOffset2_2, h_all_inputs + startOffset2_2, bytes2_2, cudaMemcpyHostToDevice, s_stream2))) { ok = false; break; }
+            started2 = true;
+        }
+
+        block = dim3(256);
+        if (cnt1_2 > 0) {
+            grid = dim3((cnt1_2 + block.x - 1) / block.x);
+            sha256_batch_kernel<<<grid, block, 0, s_stream1>>>(const_cast<const unsigned char**>(d_inputs), const_cast<unsigned int**>(d_outputs), d_lengths, cnt1_2);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+        if (cnt2_2 > 0) {
+            grid = dim3((cnt2_2 + block.x - 1) / block.x);
+            // Ensure stream2 observes pointer arrays/lengths updates
+            if (!CUDA_TRY(cudaStreamWaitEvent(s_stream2, s_evtPtrReady, 0))) { ok = false; break; }
+            sha256_batch_kernel<<<grid, block, 0, s_stream2>>>(const_cast<const unsigned char**>(d_inputs + mid2), const_cast<unsigned int**>(d_outputs + mid2), d_lengths + mid2, cnt2_2);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+
+        outBytes1_2 = sha256Words * sizeof(unsigned int) * cnt1_2;
+        outBytes2_2 = sha256Words * sizeof(unsigned int) * cnt2_2;
+        if (cnt1_2 > 0 && outBytes1_2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs, d_all_outputs, outBytes1_2, cudaMemcpyDeviceToHost, s_stream1))) { ok = false; break; }
+        }
+        if (cnt2_2 > 0 && outBytes2_2 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs + sha256Words * mid2, d_all_outputs + sha256Words * mid2, outBytes2_2, cudaMemcpyDeviceToHost, s_stream2))) { ok = false; break; }
+        }
+
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream2))) { ok = false; break; }
+
+        for (int j = 0; j < m2; ++j) {
+            int i = nonEmptyIdx2[j];
+            std::stringstream ss;
+            ss << std::hex << std::setfill('0');
+            for (int w = 0; w < 8; ++w) ss << std::setw(8) << h_all_outputs[j * 8 + w];
+            results[i] = ss.str();
+        }
+    } while(false);
+
+    if (!ok) {
+        if (started1) cudaStreamSynchronize(s_stream1);
+        if (started2) cudaStreamSynchronize(s_stream2);
+    }
+
     return results;
 }
 
 std::vector<std::string> CudaHashCalculator::CalculateBatchCRC32_GPU(const std::vector<std::vector<unsigned char>>& dataList) {
+    std::lock_guard<std::mutex> lock(s_mutex);
     std::vector<std::string> results;
-    
-    for (const auto& data : dataList) {
-        results.push_back(CalculateCRC32_GPU(data));
+    if (!isCudaAvailable || dataList.empty()) return results;
+
+    const int n = static_cast<int>(dataList.size());
+    results.resize(n);
+
+    // Pre-declare to avoid goto crossing initialization
+    std::vector<unsigned char*> h_inputs(n, nullptr);
+    std::vector<unsigned int*> h_outputs_ptrs(n, nullptr);
+    // Predeclare compact arrays to avoid goto-bypassed initialization
+    int m3 = 0;
+    std::vector<unsigned char*> h_inputs_c3;
+    std::vector<unsigned int*> h_outputs_ptrs_c3;
+    std::vector<size_t> lengths_c3;
+    std::vector<size_t> offsets_c3;
+    dim3 block;
+    dim3 grid;
+    // Predeclare split variables
+    int mid3;
+    int cnt1_3;
+    int cnt2_3;
+    size_t bytes1_3;
+    size_t bytes2_3;
+    const size_t crcWords = 1;
+    size_t outBytes1_3;
+    size_t outBytes2_3;
+    size_t startOffset2_3;
+
+    int nonEmptyCount = 0;
+    std::vector<int> nonEmptyIdx3;
+    std::vector<size_t> lengths(n, 0);
+    std::vector<size_t> offsets(n, 0);
+    size_t totalBytes = 0;
+    for (int i = 0; i < n; ++i) {
+        lengths[i] = dataList[i].size();
+        if (lengths[i] == 0) {
+            // CRC32("") standard digest with init 0xFFFFFFFF and final XOR
+            results[i] = "00000000";
+        } else {
+            offsets[i] = totalBytes;
+            totalBytes += lengths[i];
+            ++nonEmptyCount;
+            nonEmptyIdx3.push_back(i);
+        }
     }
-    
+    if (nonEmptyCount == 0) return results;
+
+    if (!EnsureHostBatchBufferCapacity(totalBytes, sizeof(unsigned int) * n)) return results;
+    unsigned char* h_all_inputs = s_h_all_inputs;
+    unsigned int* h_all_outputs = s_h_all_outputs; // 1 word per CRC32
+    for (int i = 0; i < n; ++i) if (lengths[i] > 0) memcpy(h_all_inputs + offsets[i], dataList[i].data(), lengths[i]);
+
+    unsigned char* d_all_inputs = nullptr;
+    unsigned int* d_all_outputs = nullptr;
+    unsigned char** d_inputs = nullptr;
+    unsigned int** d_outputs = nullptr;
+    size_t* d_lengths = nullptr;
+
+    bool ok = true; bool started1 = false, started2 = false;
+    do {
+        if (!EnsureDeviceBatchBufferCapacity(totalBytes, sizeof(unsigned int) * n)) { ok = false; break; }
+        d_all_inputs = s_d_all_inputs;
+        d_all_outputs = s_d_all_outputs;
+        m3 = nonEmptyCount;
+        if (!EnsureDevicePointerCapacity(m3)) { ok = false; break; }
+        d_inputs = s_d_inputs; d_outputs = s_d_outputs; d_lengths = s_d_lengths;
+
+        // Build compact arrays for non-empty entries
+        h_inputs_c3.resize(m3, nullptr);
+        h_outputs_ptrs_c3.resize(m3, nullptr);
+        lengths_c3.resize(m3, 0);
+        offsets_c3.resize(m3, 0);
+        for (int j = 0; j < m3; ++j) {
+            int i = nonEmptyIdx3[j];
+            lengths_c3[j] = lengths[i];
+            offsets_c3[j] = offsets[i];
+            h_inputs_c3[j] = d_all_inputs + offsets_c3[j];
+            h_outputs_ptrs_c3[j] = d_all_outputs + j;
+        }
+
+        if (!CUDA_TRY(cudaMemcpyAsync(d_inputs, h_inputs_c3.data(), sizeof(unsigned char*) * m3, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_outputs, h_outputs_ptrs_c3.data(), sizeof(unsigned int*) * m3, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaMemcpyAsync(d_lengths, lengths_c3.data(), sizeof(size_t) * m3, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaEventRecord(s_evtPtrReady, s_stream1))) { ok = false; break; }
+        started1 = true;
+
+        {
+            const size_t target3 = totalBytes / 2;
+            int splitIndex3 = m3;
+            for (int j = 0; j < m3; ++j) {
+                if (offsets_c3[j] >= target3) { splitIndex3 = j; break; }
+            }
+            mid3 = splitIndex3;
+        }
+        cnt1_3 = mid3;
+        cnt2_3 = m3 - mid3;
+        if (cnt1_3 > 0 && mid3 < m3) {
+            bytes1_3 = offsets_c3[mid3];
+        } else if (cnt1_3 > 0 && mid3 == m3) {
+            bytes1_3 = totalBytes;
+        } else {
+            bytes1_3 = 0;
+        }
+        startOffset2_3 = (mid3 < m3) ? offsets_c3[mid3] : totalBytes;
+        bytes2_3 = totalBytes - startOffset2_3;
+
+        if (cnt1_3 > 0 && bytes1_3 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs, h_all_inputs, bytes1_3, cudaMemcpyHostToDevice, s_stream1))) { ok = false; break; }
+            started1 = true;
+        }
+        if (cnt2_3 > 0 && bytes2_3 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(d_all_inputs + startOffset2_3, h_all_inputs + startOffset2_3, bytes2_3, cudaMemcpyHostToDevice, s_stream2))) { ok = false; break; }
+            started2 = true;
+        }
+
+        block = dim3(256);
+        if (cnt1_3 > 0) {
+            grid = dim3((cnt1_3 + block.x - 1) / block.x);
+            crc32_batch_kernel<<<grid, block, 0, s_stream1>>>(const_cast<const unsigned char**>(d_inputs), const_cast<unsigned int**>(d_outputs), d_lengths, cnt1_3);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+        if (cnt2_3 > 0) {
+            grid = dim3((cnt2_3 + block.x - 1) / block.x);
+            // Ensure stream2 observes pointer arrays/lengths updates
+            if (!CUDA_TRY(cudaStreamWaitEvent(s_stream2, s_evtPtrReady, 0))) { ok = false; break; }
+            crc32_batch_kernel<<<grid, block, 0, s_stream2>>>(const_cast<const unsigned char**>(d_inputs + mid3), const_cast<unsigned int**>(d_outputs + mid3), d_lengths + mid3, cnt2_3);
+            if (!CUDA_TRY_KERNEL_NOSYNC()) { ok = false; break; }
+        }
+
+        outBytes1_3 = crcWords * sizeof(unsigned int) * cnt1_3;
+        outBytes2_3 = crcWords * sizeof(unsigned int) * cnt2_3;
+        if (cnt1_3 > 0 && outBytes1_3 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs, d_all_outputs, outBytes1_3, cudaMemcpyDeviceToHost, s_stream1))) { ok = false; break; }
+        }
+        if (cnt2_3 > 0 && outBytes2_3 > 0) {
+            if (!CUDA_TRY(cudaMemcpyAsync(h_all_outputs + crcWords * mid3, d_all_outputs + crcWords * mid3, outBytes2_3, cudaMemcpyDeviceToHost, s_stream2))) { ok = false; break; }
+        }
+
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream1))) { ok = false; break; }
+        if (!CUDA_TRY(cudaStreamSynchronize(s_stream2))) { ok = false; break; }
+
+        for (int j = 0; j < m3; ++j) {
+            int i = nonEmptyIdx3[j];
+            std::stringstream ss;
+            ss << std::hex << std::setfill('0') << std::setw(8) << h_all_outputs[j];
+            results[i] = ss.str();
+        }
+    } while(false);
+
+    if (!ok) {
+        if (started1) cudaStreamSynchronize(s_stream1);
+        if (started2) cudaStreamSynchronize(s_stream2);
+    }
+
     return results;
 }

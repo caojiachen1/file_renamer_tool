@@ -135,6 +135,13 @@ private:
     static size_t gpuMinFileSize;
     static int selectedDevice;
     
+    // I/O performance tuning
+    static size_t ioBufferKB;      // streaming buffer size in KB (for ReadFile)
+    static size_t mmapChunkMB;     // chunk size for hashing memory-mapped views
+    static size_t gpuFileCapMB;    // max file size (MB) to load into memory for GPU hashing
+    static size_t gpuBatchBytesMB; // max total bytes per GPU mini-batch in batch mode
+    static size_t gpuChunkMB;      // chunk size (MB) for single-file CRC32 GPU chunking
+    
     // CPU-optimized hex conversion for better performance
     static std::string BytesToHexOptimized(const BYTE* data, DWORD length) {
         std::string result;
@@ -169,6 +176,128 @@ private:
     }
 
 public:
+    // Tuning setters
+    static void SetGPUMinFileSizeBytes(size_t bytes) { gpuMinFileSize = bytes; }
+    static void SetIOBufferKB(size_t kb) { ioBufferKB = (kb == 0 ? 64 : kb); }
+    static void SetMmapChunkMB(size_t mb) { mmapChunkMB = (mb == 0 ? 1 : mb); }
+    static void SetGPUFileCapMB(size_t mb) { gpuFileCapMB = (mb == 0 ? 64 : mb); }
+    static void SetGPUBatchBytesMB(size_t mb) { gpuBatchBytesMB = (mb == 0 ? 256 : mb); }
+    static void SetGPUChunkMB(size_t mb) { gpuChunkMB = (mb == 0 ? 8 : mb); }
+
+private:
+    static bool IsGPUSupportedAlgorithm(const std::string& algorithm) {
+        return (algorithm == "MD5" || algorithm == "SHA1" || algorithm == "SHA256" || algorithm == "CRC32");
+    }
+public:
+    // CRC32 combine using GF(2) matrices, operates on post-XOR (finalized) CRC values
+    static uint32_t CRC32_Combine(uint32_t crc1, uint32_t crc2, uint64_t len2) {
+        if (len2 == 0) return crc1 ^ crc2; // concatenating empty -> xor yields combined
+        // Build the operator for len2 bytes of zero appended, then apply to crc1 and xor crc2.
+        auto gf2_times = [](const uint32_t mat[32], uint32_t vec) -> uint32_t {
+            uint32_t sum = 0;
+            for (int i = 0; i < 32; ++i) {
+                if (vec & 1u) sum ^= mat[i];
+                vec >>= 1u;
+            }
+            return sum;
+        };
+        auto gf2_square = [&](uint32_t square[32], const uint32_t mat[32]) {
+            for (int i = 0; i < 32; ++i) {
+                square[i] = gf2_times(mat, mat[i]);
+            }
+        };
+        const uint32_t POLY = 0xEDB88320u; // reversed polynomial
+        uint32_t odd[32] = {0};
+        uint32_t even[32] = {0};
+        // operator for one zero bit
+        odd[0] = POLY;
+        uint32_t row = 1;
+        for (int i = 1; i < 32; ++i) { odd[i] = row; row <<= 1; }
+        // transform to one byte (8 bits) operator by repeated squaring
+        gf2_square(even, odd);  // 2 bits
+        gf2_square(odd, even);  // 4 bits
+        gf2_square(even, odd);  // 8 bits -> even now holds 8-bit operator
+        // Raise operator to len2 (bytes) power and apply to crc1
+        uint32_t op[32];
+        // start with op = even (8-bit)
+        for (int i = 0; i < 32; ++i) op[i] = even[i];
+        uint64_t n = len2;
+        uint32_t combined = crc1;
+        while (n) {
+            if (n & 1ull) combined = gf2_times(op, combined);
+            n >>= 1ull;
+            if (!n) break;
+            uint32_t next[32];
+            gf2_square(next, op);
+            for (int i = 0; i < 32; ++i) op[i] = next[i];
+        }
+        return combined ^ crc2;
+    }
+
+private:
+    static std::string CalculateFileHashCRC32_ChunkedGPU(const fs::path& filePath) {
+#ifndef USE_CUDA
+        (void)filePath; return "";
+#else
+        // Open file
+        HANDLE hFile = CreateFileW(filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return "";
+        LARGE_INTEGER liSize; if (!GetFileSizeEx(hFile, &liSize)) { CloseHandle(hFile); return ""; }
+        uint64_t totalSize = static_cast<uint64_t>(liSize.QuadPart);
+        if (totalSize == 0) { CloseHandle(hFile); return std::string("00000000"); }
+
+        const size_t chunkBytes = std::max<size_t>(gpuChunkMB * 1024ull * 1024ull, 1ull * 1024ull * 1024ull); // at least 1MB
+        const size_t batchCapBytes = std::max<size_t>(gpuBatchBytesMB * 1024ull * 1024ull, chunkBytes);
+
+        uint64_t offset = 0;
+        uint32_t crcTotal = 0x00000000u; // finalized representation for empty prefix
+        while (offset < totalSize) {
+            // prepare one GPU mini-batch
+            std::vector<std::vector<unsigned char>> chunks;
+            chunks.reserve(static_cast<size_t>(batchCapBytes / chunkBytes) + 1);
+            uint64_t bytesQueued = 0;
+            std::vector<uint32_t> chunkLens;
+
+            while (offset < totalSize && bytesQueued < batchCapBytes) {
+                size_t toRead = static_cast<size_t>(std::min<uint64_t>(chunkBytes, totalSize - offset));
+                std::vector<unsigned char> buf(toRead);
+                DWORD read = 0; BOOL ok = ReadFile(hFile, buf.data(), static_cast<DWORD>(toRead), &read, NULL);
+                if (!ok) { CloseHandle(hFile); return ""; }
+                if (read == 0) break;
+                buf.resize(read);
+                chunks.emplace_back(std::move(buf));
+                chunkLens.emplace_back(read);
+                bytesQueued += read;
+                offset += read;
+            }
+            if (chunks.empty()) break;
+
+            // GPU batch CRC32 on chunks
+            auto hashes = CudaHashCalculator::CalculateBatchCRC32_GPU(chunks);
+            if (hashes.size() != chunks.size()) { CloseHandle(hFile); return ""; }
+
+            // Combine with running CRC
+            for (size_t i = 0; i < hashes.size(); ++i) {
+                const std::string& hx = hashes[i];
+                if (hx.size() != 8) { CloseHandle(hFile); return ""; }
+                // parse hex to uint32
+                uint32_t c = 0;
+                for (char ch : hx) {
+                    c <<= 4;
+                    if (ch >= '0' && ch <= '9') c |= static_cast<uint32_t>(ch - '0');
+                    else if (ch >= 'a' && ch <= 'f') c |= static_cast<uint32_t>(ch - 'a' + 10);
+                    else if (ch >= 'A' && ch <= 'F') c |= static_cast<uint32_t>(ch - 'A' + 10);
+                }
+                crcTotal = CRC32_Combine(crcTotal, c, chunkLens[i]);
+            }
+        }
+        CloseHandle(hFile);
+        std::stringstream ss; ss << std::hex << std::setfill('0') << std::setw(8) << crcTotal;
+        return ss.str();
+#endif
+    }
+public:
+
     // GPU acceleration functions
     static bool InitializeGPU(int deviceId = -2) { // -2 means auto, -1 means CPU, >=0 means specific GPU
         if (gpuInitialized) return useGPU;
@@ -713,6 +842,30 @@ public:
         return data;
     }
     
+    // High-throughput full-file read using WinAPI (for optional GPU hashing path)
+    static std::vector<BYTE> ReadFileEntireWin(const fs::path& filePath) {
+        std::vector<BYTE> data;
+        HANDLE hFile = CreateFileW(filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return data;
+        LARGE_INTEGER li; li.QuadPart = 0;
+        if (!GetFileSizeEx(hFile, &li) || li.QuadPart < 0) { CloseHandle(hFile); return data; }
+        size_t total = static_cast<size_t>(li.QuadPart);
+        data.resize(total);
+        size_t offset = 0;
+        const DWORD chunk = static_cast<DWORD>(std::min<size_t>(ioBufferKB * 1024ull, 4ull * 1024ull * 1024ull));
+        DWORD bytesRead = 0; BOOL ok = FALSE;
+        while (offset < total) {
+            DWORD toRead = static_cast<DWORD>(std::min<size_t>(chunk, total - offset));
+            ok = ReadFile(hFile, data.data() + offset, toRead, &bytesRead, NULL);
+            if (!ok) { data.clear(); break; }
+            if (bytesRead == 0) break;
+            offset += bytesRead;
+        }
+        CloseHandle(hFile);
+        if (offset != total) data.clear();
+        return data;
+    }
+    
     // Helper function to get hash size and algorithm ID
     static std::pair<DWORD, ALG_ID> GetHashInfo(const std::string& algorithm) {
         if (algorithm == "MD5") {
@@ -734,7 +887,7 @@ public:
     
     // Memory-mapped file hash calculation for very large files
     static std::string CalculateFileHashMemoryMapped(const fs::path& filePath, const std::string& algorithm = "MD5") {
-        // For algorithms not supported by Windows Crypto API, use regular streaming
+        // For algorithms not supported by Windows Crypto API, use streaming (true streaming for CRC32/BLAKE2B)
         if (algorithm == "CRC32" || algorithm == "BLAKE2B") {
             return CalculateFileHashStreaming(filePath, algorithm);
         }
@@ -803,11 +956,12 @@ public:
             
             if (CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
                 // Process in chunks to avoid overwhelming the hash function
-                const DWORD CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+                const DWORD CHUNK_SIZE = static_cast<DWORD>(mmapChunkMB * 1024ull * 1024ull); // configurable MB
+                const DWORD CHUNK_SIZE_SAFE = (CHUNK_SIZE == 0 ? (4 * 1024 * 1024) : CHUNK_SIZE);
                 DWORD totalSize = static_cast<DWORD>(fileSize.QuadPart);
                 
-                for (DWORD offset = 0; offset < totalSize; offset += CHUNK_SIZE) {
-                    DWORD chunkSize = (CHUNK_SIZE < totalSize - offset) ? CHUNK_SIZE : (totalSize - offset);
+                for (DWORD offset = 0; offset < totalSize; offset += CHUNK_SIZE_SAFE) {
+                    DWORD chunkSize = (CHUNK_SIZE_SAFE < totalSize - offset) ? CHUNK_SIZE_SAFE : (totalSize - offset);
                     if (!CryptHashData(hHash, pData + offset, chunkSize, 0)) {
                         break;
                     }
@@ -837,81 +991,134 @@ public:
 
     // Optimized streaming hash calculation for large files
     static std::string CalculateFileHashStreaming(const fs::path& filePath, const std::string& algorithm = "MD5") {
-        // For algorithms not supported by Windows Crypto API, use custom implementations
-        if (algorithm == "CRC32" || algorithm == "BLAKE2B") {
-            auto data = ReadFileData(filePath);
-            if (data.empty()) {
-                return "";
-            }
-            return CalculateHash(data, algorithm);
-        }
-        
-        std::ifstream file(filePath, std::ios::binary);
-        if (!file.is_open()) {
+        // True streaming for CRC32 and BLAKE2B placeholder; WinCrypto for others with WinAPI I/O
+        const DWORD desiredAccess = GENERIC_READ;
+        const DWORD shareMode = FILE_SHARE_READ;
+        const DWORD creationDisposition = OPEN_EXISTING;
+        const DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+
+        HANDLE hFile = CreateFileW(filePath.wstring().c_str(), desiredAccess, shareMode, NULL, creationDisposition, flags, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
             return "";
         }
-        
+
+        const size_t BUFFER_SIZE = std::max<size_t>(ioBufferKB * 1024ull, 64 * 1024ull);
+        std::vector<BYTE> buffer(BUFFER_SIZE);
+
+        if (algorithm == "CRC32") {
+            // Initialize CRC32 table
+            static const uint32_t CRC32_POLY = 0xEDB88320;
+            static uint32_t crc_table[256];
+            static std::once_flag crc_once;
+            std::call_once(crc_once, [](){
+                for (uint32_t i = 0; i < 256; i++) {
+                    uint32_t crc = i;
+                    for (int j = 0; j < 8; j++) crc = (crc & 1) ? (crc >> 1) ^ CRC32_POLY : (crc >> 1);
+                    crc_table[i] = crc;
+                }
+            });
+
+            uint32_t crc = 0xFFFFFFFF;
+            DWORD bytesRead = 0;
+            BOOL ok = FALSE;
+            do {
+                ok = ReadFile(hFile, buffer.data(), static_cast<DWORD>(BUFFER_SIZE), &bytesRead, NULL);
+                if (!ok) break;
+                if (bytesRead == 0) break;
+                for (DWORD i = 0; i < bytesRead; ++i) crc = crc_table[(crc ^ buffer[i]) & 0xFFu] ^ (crc >> 8);
+            } while (bytesRead > 0);
+
+            CloseHandle(hFile);
+            if (!ok) return "";
+            crc ^= 0xFFFFFFFFu;
+            std::stringstream ss; ss << std::hex << std::setfill('0') << std::setw(8) << crc;
+            return ss.str();
+        }
+
+        if (algorithm == "BLAKE2B") {
+            // Stream the placeholder implementation
+            static const uint64_t IV[8] = {
+                0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+                0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+                0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+                0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+            };
+            uint64_t hash = 0;
+            DWORD bytesRead = 0; BOOL ok = FALSE;
+            do {
+                ok = ReadFile(hFile, buffer.data(), static_cast<DWORD>(BUFFER_SIZE), &bytesRead, NULL);
+                if (!ok) break;
+                if (bytesRead == 0) break;
+                for (DWORD i = 0; i < bytesRead; ++i) {
+                    hash = ((hash << 5) + hash) + buffer[i];
+                    hash ^= IV[i % 8];
+                }
+            } while (bytesRead > 0);
+            CloseHandle(hFile);
+            if (!ok) return "";
+            std::stringstream ss;
+            for (int i = 0; i < 4; i++) {
+                uint64_t part = hash ^ IV[i] ^ (static_cast<uint64_t>(i) * 0x123456789ABCDEFULL);
+                ss << std::hex << std::setfill('0') << std::setw(16) << part;
+            }
+            return ss.str();
+        }
+
+        // Windows Crypto API streaming (MD5/SHA1/SHA256/SHA512)
         auto hashInfo = GetHashInfo(algorithm);
         DWORD hashSize = hashInfo.first;
         ALG_ID algId = hashInfo.second;
-        
-        if (hashSize == 0) {
-            return "";
-        }
-        
+        if (hashSize == 0) { CloseHandle(hFile); return ""; }
+
         HCRYPTPROV hProv = 0;
-        
-        // Try enhanced provider first for newer algorithms
         bool useEnhanced = (algorithm == "SHA256" || algorithm == "SHA512");
         if (useEnhanced) {
             if (!CryptAcquireContext(&hProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
                 if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+                    CloseHandle(hFile);
                     return "";
                 }
             }
         } else {
             if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+                CloseHandle(hFile);
                 return "";
             }
         }
-        
+
         HCRYPTHASH hHash = 0;
         if (!CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
             CryptReleaseContext(hProv, 0);
+            CloseHandle(hFile);
             return "";
         }
-        
-        // Process file in chunks to save memory
-        const size_t BUFFER_SIZE = 64 * 1024; // 64KB chunks
-        std::vector<BYTE> buffer(BUFFER_SIZE);
-        
-        while (file.good()) {
-            file.read(reinterpret_cast<char*>(buffer.data()), BUFFER_SIZE);
-            std::streamsize bytesRead = file.gcount();
-            
-            if (bytesRead > 0) {
-                if (!CryptHashData(hHash, buffer.data(), static_cast<DWORD>(bytesRead), 0)) {
-                    CryptDestroyHash(hHash);
-                    CryptReleaseContext(hProv, 0);
-                    return "";
-                }
-            }
+
+        DWORD bytesRead = 0; BOOL ok = FALSE;
+        do {
+            ok = ReadFile(hFile, buffer.data(), static_cast<DWORD>(BUFFER_SIZE), &bytesRead, NULL);
+            if (!ok) break;
+            if (bytesRead == 0) break;
+            if (!CryptHashData(hHash, buffer.data(), bytesRead, 0)) { ok = FALSE; break; }
+        } while (bytesRead > 0);
+
+        CloseHandle(hFile);
+
+        if (!ok) {
+            CryptDestroyHash(hHash);
+            CryptReleaseContext(hProv, 0);
+            return "";
         }
-        
-        std::vector<BYTE> rgbHash(hashSize);
-        DWORD cbHash = hashSize;
-        
+
+        std::vector<BYTE> rgbHash(hashSize); DWORD cbHash = hashSize;
         if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash.data(), &cbHash, 0)) {
             CryptDestroyHash(hHash);
             CryptReleaseContext(hProv, 0);
             return "";
         }
-        
+
         std::string result = BytesToHex(rgbHash.data(), cbHash);
-        
         CryptDestroyHash(hHash);
         CryptReleaseContext(hProv, 0);
-        
         return result;
     }
     
@@ -923,6 +1130,29 @@ public:
         
         if (ec) {
             return "";
+        }
+        
+        // Special fast path: CRC32 single-file GPU chunked processing for large files
+        if (algorithm == "CRC32" && useGPU) {
+            if (fileSize >= gpuMinFileSize) {
+                // Prefer chunked GPU path when file is larger than in-memory cap
+                if (static_cast<uint64_t>(fileSize) > gpuFileCapMB * 1024ull * 1024ull) {
+                    auto res = CalculateFileHashCRC32_ChunkedGPU(filePath);
+                    if (!res.empty()) return res;
+                    // on failure, fall back
+                }
+            }
+        }
+
+        // Fast path: if GPU available and file size within cap, load entire file and hash on GPU for supported algos
+        if (useGPU && (algorithm == "MD5" || algorithm == "SHA1" || algorithm == "SHA256" || algorithm == "CRC32")) {
+            if (fileSize >= gpuMinFileSize && fileSize <= gpuFileCapMB * 1024ull * 1024ull) {
+                auto data = ReadFileEntireWin(filePath);
+                if (!data.empty()) {
+                    return CalculateHash(data, algorithm); // will route to GPU if above min size
+                }
+                // fallback if read failed -> continue
+            }
         }
         
         // Use memory mapping for very large files (>100MB)
@@ -1609,13 +1839,17 @@ public:
             numThreads = std::min(numThreads * 2, 32);
         }
         
-        std::cout << "Ultra-fast processing mode enabled!" << std::endl;
+    std::cout << "Ultra-fast processing mode enabled!" << std::endl;
         std::cout << "Scanning directory: " << directoryPath << std::endl;
         std::cout << "Algorithm: " << algorithm << std::endl;
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Optimized threads: " << numThreads << std::endl;
+    std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
+        if (useGPU) {
+            std::cout << "GPU min: " << (gpuMinFileSize/1024) << " KB, file-cap: " << gpuFileCapMB << " MB, batch-cap: " << gpuBatchBytesMB << " MB" << std::endl;
+        }
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -1893,8 +2127,9 @@ public:
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
-        std::cout << "Threads: " << numThreads << std::endl;
-        std::cout << "Batch size: " << batchSize << std::endl;
+    std::cout << "Threads: " << numThreads << std::endl;
+    std::cout << "Batch size: " << batchSize << std::endl;
+    std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
         
         // Display device status
         if (!gpuInitialized) {
@@ -1903,6 +2138,7 @@ public:
         std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
         if (useGPU) {
             std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
+            std::cout << "GPU batch cap: " << gpuBatchBytesMB << " MB" << std::endl;
         }
         
         if (!allowedExtensions.empty()) {
@@ -1974,6 +2210,77 @@ public:
                 
                 const auto& batch = batches[batchIndex];
                 
+                struct GpuCandidate { size_t fileIndex; fs::path path; uintmax_t fileSize; std::string prelude; };
+                std::vector<GpuCandidate> gpuCandidates;
+                size_t gpuBytesAccum = 0;
+                auto flushGpu = [&]() {
+#ifdef USE_CUDA
+                    if (!useGPU || gpuCandidates.empty() || !IsGPUSupportedAlgorithm(algorithm)) { gpuCandidates.clear(); gpuBytesAccum = 0; return; }
+                    // Build data list within cap
+                    std::vector<std::vector<unsigned char>> dataList;
+                    dataList.reserve(gpuCandidates.size());
+                    std::vector<bool> ok(gpuCandidates.size(), false);
+                    for (size_t k = 0; k < gpuCandidates.size(); ++k) {
+                        auto d = ReadFileEntireWin(gpuCandidates[k].path);
+                        if (!d.empty() || gpuCandidates[k].fileSize == 0) { ok[k] = true; dataList.emplace_back(std::move(d)); }
+                        else { dataList.emplace_back(); }
+                    }
+                    std::vector<std::string> hashes;
+                    if (algorithm == "MD5") hashes = CudaHashCalculator::CalculateBatchMD5_GPU(dataList);
+                    else if (algorithm == "SHA1") hashes = CudaHashCalculator::CalculateBatchSHA1_GPU(dataList);
+                    else if (algorithm == "SHA256") hashes = CudaHashCalculator::CalculateBatchSHA256_GPU(dataList);
+                    else if (algorithm == "CRC32") hashes = CudaHashCalculator::CalculateBatchCRC32_GPU(dataList);
+                    // Emit results per candidate (fallback to CPU if needed)
+                    for (size_t k = 0; k < gpuCandidates.size(); ++k) {
+                        const auto& file = batch[gpuCandidates[k].fileIndex];
+                        std::stringstream out;
+                        out << gpuCandidates[k].prelude;
+                        std::string hash;
+                        if (k < hashes.size() && !hashes[k].empty() && ok[k]) {
+                            hash = hashes[k];
+                        } else {
+                            // CPU fallback
+                            hash = CalculateFileHashOptimized(file, algorithm);
+                        }
+                        if (hash.empty()) {
+                            out << "  Error: Could not calculate hash" << std::endl << std::endl;
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << out.str();
+                            }
+                            continue;
+                        }
+                        std::string extension = file.extension().string();
+                        std::string newFileName = hash + extension;
+                        fs::path newPath = file.parent_path() / newFileName;
+                        out << "  Hash (" << algorithm << "): " << hash << std::endl;
+                        out << "  New name: " << newFileName << std::endl;
+                        if (file.filename() == newFileName) {
+                            out << "  Status: No change needed (filename already matches hash)" << std::endl << std::endl;
+                            noChangeCount++;
+                        } else if (!dryRun) {
+                            if (RenameFile(file, newPath)) {
+                                out << "  Status: Renamed successfully" << std::endl << std::endl;
+                                successCount++;
+                            } else {
+                                out << "  Status: Failed to rename" << std::endl << std::endl;
+                            }
+                        } else {
+                            out << "  Status: Preview only (will be renamed)" << std::endl << std::endl;
+                        }
+                        processedCount++;
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            std::cout << out.str();
+                        }
+                    }
+                    gpuCandidates.clear();
+                    gpuBytesAccum = 0;
+#else
+                    (void)gpuCandidates; (void)gpuBytesAccum; // suppress unused warnings
+#endif
+                };
+                
                 // Process all files in this batch
                 for (size_t fileIndex = 0; fileIndex < batch.size(); fileIndex++) {
                     const auto& file = batch[fileIndex];
@@ -1981,85 +2288,88 @@ public:
                     try {
                         std::string fileName = file.filename().string();
                         size_t globalIndex = batchIndex * batchSize + fileIndex;
-                        
-                        // Thread-safe progress output
-                        {
-                            std::lock_guard<std::mutex> lock(outputMutex);
-                            std::cout << "[" << (globalIndex + 1) << "/" << files.size() << "] Batch " << (batchIndex + 1) << "/" << batches.size() << " Processing: \"" << fileName << "\"" << std::endl;
-                        }
+                        std::stringstream prelude;
+                        prelude << "[" << (globalIndex + 1) << "/" << files.size() << "] Batch " << (batchIndex + 1) << "/" << batches.size() << " Processing: \"" << fileName << "\"" << std::endl;
                         
                         // Check if file extension matches filter
                         if (!ShouldProcessFile(file, allowedExtensions)) {
                             std::string extension = file.extension().string();
+                            prelude << "  Extension: \"" << extension << "\"" << std::endl;
+                            prelude << "  Status: Skipped (extension not in filter)" << std::endl << std::endl;
+                            skippedCount++;
                             {
                                 std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << "  Extension: \"" << extension << "\"" << std::endl;
-                                std::cout << "  Status: Skipped (extension not in filter)" << std::endl;
-                                std::cout << std::endl;
+                                std::cout << prelude.str();
                             }
-                            skippedCount++;
                             continue;
                         }
                         
                         // Quick check optimization
                         if (quickCheck && QuickHashCheck(file, algorithm)) {
-                            {
-                                std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << "  Status: Likely already correctly named (quick check passed)" << std::endl;
-                                std::cout << std::endl;
-                            }
+                            prelude << "  Status: Likely already correctly named (quick check passed)" << std::endl << std::endl;
                             quickSkipCount++;
+                            {
+                                std::lock_guard<std::mutex> lock(outputMutex);
+                                std::cout << prelude.str();
+                            }
                             continue;
                         }
                         
-                        processedCount++;
-                        
-                        std::string hash = CalculateFileHashOptimized(file, algorithm);
-                        if (hash.empty()) {
-                            std::lock_guard<std::mutex> lock(outputMutex);
-                            std::cout << "  Error: Could not calculate hash" << std::endl;
-                            std::cout << std::endl;
+                        // Decide GPU vs CPU path in batch mode
+                        bool tryGPU = false;
+                        uintmax_t fsize = 0;
+                        std::error_code fec;
+                        fsize = fs::file_size(file, fec);
+                        if (!fec) {
+                            tryGPU = useGPU && IsGPUSupportedAlgorithm(algorithm) && fsize >= gpuMinFileSize && fsize <= (gpuFileCapMB * 1024ull * 1024ull);
+                        }
+                        if (tryGPU) {
+                            // Queue for GPU mini-batch; flush if exceeds cap
+                            size_t capBytes = gpuBatchBytesMB * 1024ull * 1024ull;
+                            if (gpuBytesAccum + static_cast<size_t>(fsize) > capBytes && !gpuCandidates.empty()) {
+                                flushGpu();
+                            }
+                            GpuCandidate gc{fileIndex, file, fsize, prelude.str()};
+                            gpuBytesAccum += static_cast<size_t>(fsize);
+                            gpuCandidates.emplace_back(std::move(gc));
                             continue;
                         }
                         
-                        std::string extension = file.extension().string();
-                        std::string newFileName = hash + extension;
-                        fs::path newPath = file.parent_path() / newFileName;
-                        
+                        // CPU path immediate
                         {
-                            std::lock_guard<std::mutex> lock(outputMutex);
-                            std::cout << "  Hash (" << algorithm << "): " << hash << std::endl;
-                            std::cout << "  New name: " << newFileName << std::endl;
-                        }
-                        
-                        // Check if the new filename is the same as the current filename
-                        if (file.filename() == newFileName) {
-                            {
-                                std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << "  Status: No change needed (filename already matches hash)" << std::endl;
-                                std::cout << std::endl;
-                            }
-                            noChangeCount++;
-                        } else if (!dryRun) {
-                            if (RenameFile(file, newPath)) {
+                            std::string hash = CalculateFileHashOptimized(file, algorithm);
+                            std::stringstream out;
+                            out << prelude.str();
+                            if (hash.empty()) {
+                                out << "  Error: Could not calculate hash" << std::endl << std::endl;
                                 {
                                     std::lock_guard<std::mutex> lock(outputMutex);
-                                    std::cout << "  Status: Renamed successfully" << std::endl;
-                                    std::cout << std::endl;
+                                    std::cout << out.str();
                                 }
-                                successCount++;
+                                continue;
+                            }
+                            std::string extension = file.extension().string();
+                            std::string newFileName = hash + extension;
+                            fs::path newPath = file.parent_path() / newFileName;
+                            out << "  Hash (" << algorithm << "): " << hash << std::endl;
+                            out << "  New name: " << newFileName << std::endl;
+                            if (file.filename() == newFileName) {
+                                out << "  Status: No change needed (filename already matches hash)" << std::endl << std::endl;
+                                noChangeCount++;
+                            } else if (!dryRun) {
+                                if (RenameFile(file, newPath)) {
+                                    out << "  Status: Renamed successfully" << std::endl << std::endl;
+                                    successCount++;
+                                } else {
+                                    out << "  Status: Failed to rename" << std::endl << std::endl;
+                                }
                             } else {
-                                {
-                                    std::lock_guard<std::mutex> lock(outputMutex);
-                                    std::cout << "  Status: Failed to rename" << std::endl;
-                                    std::cout << std::endl;
-                                }
+                                out << "  Status: Preview only (will be renamed)" << std::endl << std::endl;
                             }
-                        } else {
+                            processedCount++;
                             {
                                 std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << "  Status: Preview only (will be renamed)" << std::endl;
-                                std::cout << std::endl;
+                                std::cout << out.str();
                             }
                         }
                         
@@ -2072,6 +2382,8 @@ public:
                         skippedCount++;
                     }
                 }
+                // Flush remaining GPU candidates for this batch
+                flushGpu();
             }
         };
         
@@ -2129,6 +2441,11 @@ bool FileRenamerCLI::gpuInitialized = false;
 bool FileRenamerCLI::useGPU = false;
 size_t FileRenamerCLI::gpuMinFileSize = 4096;
 int FileRenamerCLI::selectedDevice = -1;
+size_t FileRenamerCLI::ioBufferKB = 1024;   // 1MB default streaming buffer
+size_t FileRenamerCLI::mmapChunkMB = 4;     // 4MB default mmap feed chunk
+size_t FileRenamerCLI::gpuFileCapMB = 64;   // 64MB default cap for GPU in-memory hashing
+size_t FileRenamerCLI::gpuBatchBytesMB = 256; // 256MB default GPU mini-batch cap
+size_t FileRenamerCLI::gpuChunkMB = 8;      // 8MB default single-file CRC32 GPU chunk size
 
 void PrintUsage() {
     std::cout << "File Batch Renamer Tool" << std::endl;
@@ -2148,6 +2465,12 @@ void PrintUsage() {
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
     std::cout << "  -d, --device <id|cpu|auto> Device to use: -1 or 'cpu' for CPU, 0,1,2... for GPU, 'auto' for best available" << std::endl;
     std::cout << "                          Use 'list' to show available devices [default: auto]" << std::endl;
+    std::cout << "  --gpu-min-kb <n>        Minimum file size (KB) to use GPU [default: 4]" << std::endl;
+    std::cout << "  --buffer-kb <n>         Streaming buffer size (KB) for hashing [default: 1024]" << std::endl;
+    std::cout << "  --mmap-chunk-mb <n>     Chunk size (MB) to feed from memory-mapped views [default: 4]" << std::endl;
+    std::cout << "  --gpu-file-cap-mb <n>   Max file size (MB) to load entirely for GPU hashing [default: 64]" << std::endl;
+    std::cout << "  --gpu-batch-bytes-mb <n> Max total bytes (MB) per GPU mini-batch in batch mode [default: 256]" << std::endl;
+    std::cout << "  --gpu-chunk-mb <n>      Single-file CRC32 GPU chunk size (MB) [default: 8]" << std::endl;
     std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
     std::cout << "  --multi-thread          Use multi-threaded processing [default]" << std::endl;
     std::cout << "  --batch-mode            Use batch processing mode (best for large datasets)" << std::endl;
@@ -2232,6 +2555,12 @@ int main(int argc, char* argv[]) {
     bool autoConfirm = false; // Auto-confirm without user interaction
     int numThreads = 0; // Auto-detect by default
     size_t batchSize = 0; // Auto-calculate by default
+    size_t argGpuMinKB = 4; // default 4KB threshold
+    size_t argBufferKB = 1024; // default 1MB buffer
+    size_t argMmapChunkMB = 4; // default 4MB
+    size_t argGPUFileCapMB = 64; // default 64MB
+    size_t argGPUBatchBytesMB = 256; // default 256MB
+    size_t argGPUChunkMB = 8; // default 8MB for single-file CRC32 chunking
     enum ProcessingMode { ULTRA_FAST, MULTI_THREAD, BATCH_MODE, SINGLE_THREAD };
     ProcessingMode mode = ULTRA_FAST; // Default to ultra-fast mode
     std::vector<std::string> allowedExtensions;
@@ -2305,6 +2634,30 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: No valid extensions specified" << std::endl;
                 return 1;
             }
+        } else if (arg == "--gpu-min-kb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --gpu-min-kb value" << std::endl; return 1; }
+            argGpuMinKB = static_cast<size_t>(v);
+        } else if (arg == "--buffer-kb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --buffer-kb value" << std::endl; return 1; }
+            argBufferKB = static_cast<size_t>(v);
+        } else if (arg == "--mmap-chunk-mb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --mmap-chunk-mb value" << std::endl; return 1; }
+            argMmapChunkMB = static_cast<size_t>(v);
+        } else if (arg == "--gpu-file-cap-mb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --gpu-file-cap-mb value" << std::endl; return 1; }
+            argGPUFileCapMB = static_cast<size_t>(v);
+        } else if (arg == "--gpu-batch-bytes-mb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --gpu-batch-bytes-mb value" << std::endl; return 1; }
+            argGPUBatchBytesMB = static_cast<size_t>(v);
+        } else if (arg == "--gpu-chunk-mb" && i + 1 < argc) {
+            long v = std::strtol(argv[++i], nullptr, 10);
+            if (v <= 0) { std::cerr << "Error: Invalid --gpu-chunk-mb value" << std::endl; return 1; }
+            argGPUChunkMB = static_cast<size_t>(v);
         } else if (directory.empty() && arg[0] != '-') {
             directory = arg;
         } else {
@@ -2337,7 +2690,16 @@ int main(int argc, char* argv[]) {
         selectedDeviceId = std::atoi(deviceSelection.c_str()); // Specific device ID (including -1 for CPU)
     }
     
+    // Apply I/O tuning params
+    FileRenamerCLI::SetIOBufferKB(argBufferKB);
+    FileRenamerCLI::SetMmapChunkMB(argMmapChunkMB);
+    FileRenamerCLI::SetGPUFileCapMB(argGPUFileCapMB);
+    FileRenamerCLI::SetGPUBatchBytesMB(argGPUBatchBytesMB);
+    FileRenamerCLI::SetGPUChunkMB(argGPUChunkMB);
+
     bool gpuAvailable = FileRenamerCLI::InitializeGPU(selectedDeviceId);
+    // Apply GPU min threshold after potential initialization changes
+    FileRenamerCLI::SetGPUMinFileSizeBytes(argGpuMinKB * 1024ull);
     
     if (!dryRun) {
         std::cout << "WARNING: This will permanently rename files!" << std::endl;
