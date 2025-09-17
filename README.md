@@ -94,6 +94,7 @@ file_renamer.exe <directory> [options]
 - `-t, --threads <n>` - Number of processing threads [default: auto]
 - `-q, --quick` - Enable quick check for already-named files
 - `--ultra-fast` - Enable ultra-fast pipeline (aggressive I/O + scheduling)
+   - 默认会使用机器的全部逻辑CPU线程以获得最大吞吐（可用 `-t` 手动指定覆盖）
 - `--extreme` - Extreme performance mode (very aggressive auto-tuning; higher RAM/VRAM & I/O usage)
 - `-y, --yes` - Auto-confirm without user interaction
 - `-h, --help` - Show help message
@@ -194,7 +195,48 @@ Preview, ultra-fast + extreme, auto device selection:
 file_renamer.exe C:\MyFiles --ultra-fast --extreme -d auto -q -r
 ```
 
+Note: Ultra-fast 模式在未显式指定 `-t` 时将默认使用机器全部逻辑线程数（`std::thread::hardware_concurrency()`）。
+
 Execute on GPU 0 with extreme tuning and SHA256:
 ```cmd
 file_renamer.exe C:\MyFiles -a SHA256 -e -r -d 0 --ultra-fast --extreme -y
 ```
+
+## Web 界面（本地）
+
+项目包含一个简洁的本地 Web UI，方便可视化配置与运行：
+
+### 启动（Windows）
+
+1. 运行 `start_web.bat`（双击或在命令行）。
+   - 自动创建 `.venv` 虚拟环境
+   - 安装依赖（Flask）
+   - 启动 Web 服务（默认 http://127.0.0.1:5000）
+2. 打开浏览器访问 `http://127.0.0.1:5000`。
+3. 在页面中填写：目录路径、算法、模式、设备（auto/CPU/GPU id），是否递归，是否执行（默认预览）、线程/批大小、扩展名过滤，以及可选高级参数。
+4. 点击“运行”查看流式输出；可随时“停止”。
+
+设备列表：点击页面“刷新”按钮将调用 `-d list` 并展示可用设备 ID。
+
+### 可执行文件查找顺序
+
+Web 后端会按顺序寻找下列可执行文件：
+
+1. `file_renamer.exe`
+2. `file_renamer_cli.exe`
+3. `build/Release/file_renamer_cli.exe`
+4. `build/Debug/file_renamer_cli_d.exe`
+
+若均不存在，会在界面与接口报错提示。
+
+### 自定义监听
+
+默认监听 127.0.0.1:5000。若要修改：
+
+```cmd
+set HOST=0.0.0.0
+set PORT=6000
+start_web.bat
+```
+
+注意：对外开放时请注意网络环境与权限控制。

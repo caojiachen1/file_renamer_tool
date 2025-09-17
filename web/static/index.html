@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>File Renamer Web UI</title>
+    <style>
+      body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 16px; background: #0b0d10; color: #e6edf3; }
+      h1 { font-size: 20px; }
+      fieldset { border: 1px solid #2d333b; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+      legend { color: #9da7b1; }
+      label { display: inline-block; margin: 6px 0 4px; }
+      input[type=text], input[type=number], select { width: 100%; padding: 8px; background: #0e1116; border: 1px solid #2d333b; color: #e6edf3; border-radius: 6px; }
+      input[type=checkbox] { transform: translateY(1px); }
+      .row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+      .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+      .actions { display: flex; gap: 8px; margin-top: 8px; }
+      button { background: #238636; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
+      button.secondary { background: #30363d; }
+      button.warn { background: #d29922; }
+      button:disabled { opacity: .6; cursor: not-allowed; }
+      pre { background: #0e1116; border: 1px solid #2d333b; padding: 12px; border-radius: 8px; height: 380px; overflow: auto; white-space: pre-wrap; }
+      small { color: #9da7b1; }
+      .hint { color: #9da7b1; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>文件批量重命名 · Web 界面</h1>
+    <fieldset>
+      <legend>基本设置</legend>
+      <div class="row" style="row-gap:14px; column-gap:18px;">
+        <div>
+          <label>目录路径</label>
+          <div style="display:flex; gap:8px;">
+            <input id="directory" type="text" placeholder="例如：D:\Downloads" style="flex:1;" />
+            <button id="btnBrowse" class="secondary">选择...</button>
+          </div>
+          <small class="hint">请输入本机磁盘中的文件夹路径，或使用“选择...”打开文件夹对话框</small>
+        </div>
+        <div>
+          <label>算法</label>
+          <select id="algorithm">
+            <option>MD5</option>
+            <option>SHA1</option>
+            <option>SHA256</option>
+            <option>SHA512</option>
+            <option>CRC32</option>
+            <option>BLAKE2B</option>
+          </select>
+        </div>
+      </div>
+  <div class="row3" style="margin-top:12px; gap:16px;">
+        <div>
+          <label>模式</label>
+          <select id="mode">
+            <option value="ultra-fast">Ultra Fast</option>
+            <option value="multi-thread">Multi Thread</option>
+            <option value="batch-mode">Batch Mode</option>
+            <option value="single-thread">Single Thread</option>
+          </select>
+        </div>
+        <div>
+          <label>设备</label>
+          <div style="display:flex; gap:6px;">
+            <select id="device" style="flex:1;">
+              <option value="auto">auto</option>
+              <option value="cpu">cpu</option>
+              <option value="0">GPU 0</option>
+              <option value="1">GPU 1</option>
+            </select>
+            <button class="secondary" id="btnDevices" title="列出设备">刷新</button>
+          </div>
+          <small id="devicesOut" class="hint"></small>
+        </div>
+        <div>
+          <label>扩展名过滤（逗号分隔）</label>
+          <input id="extensions" type="text" placeholder="jpg,png,txt 或 .jpg,.png,.txt" />
+        </div>
+      </div>
+
+  <div class="row3" style="margin-top:12px; gap:16px;">
+        <div>
+          <label>线程数</label>
+          <input id="threads" type="number" min="1" placeholder="留空=自动" />
+        </div>
+        <div>
+          <label>批大小</label>
+          <input id="batch" type="number" min="1" placeholder="留空=自动" />
+        </div>
+        <div>
+          <label>快速检查</label><br />
+          <input id="quick" type="checkbox" checked /> 启用
+        </div>
+      </div>
+
+  <div class="row3" style="margin-top:12px; gap:16px;">
+        <div>
+          <label>执行模式</label><br />
+          <input id="execute" type="checkbox" /> 执行重命名（默认预览）
+        </div>
+        <div>
+          <label>递归</label><br />
+          <input id="recursive" type="checkbox" /> 包含子目录
+        </div>
+        <div>
+          <label>极限调优</label><br />
+          <input id="extreme" type="checkbox" /> Extreme 模式
+        </div>
+      </div>
+
+  <details style="margin-top:12px;">
+        <summary>高级参数（可选）</summary>
+  <div class="row3" style="margin-top:12px; gap:16px;">
+          <div>
+            <label>GPU最小KB</label>
+            <input id="gpu_min_kb" type="number" min="1" placeholder="自动" />
+          </div>
+          <div>
+            <label>缓冲KB</label>
+            <input id="buffer_kb" type="number" min="1" placeholder="自动" />
+          </div>
+          <div>
+            <label>mmap块MB</label>
+            <input id="mmap_chunk_mb" type="number" min="1" placeholder="自动" />
+          </div>
+        </div>
+  <div class="row3" style="margin-top:12px; gap:16px;">
+          <div>
+            <label>GPU文件上限MB</label>
+            <input id="gpu_file_cap_mb" type="number" min="1" placeholder="自动" />
+          </div>
+          <div>
+            <label>GPU批总字节MB</label>
+            <input id="gpu_batch_bytes_mb" type="number" min="1" placeholder="自动" />
+          </div>
+          <div>
+            <label>GPU分块MB</label>
+            <input id="gpu_chunk_mb" type="number" min="1" placeholder="自动" />
+          </div>
+        </div>
+      </details>
+
+      <div class="actions" style="margin-top:12px;">
+        <button id="run">运行</button>
+        <button id="stop" class="warn" disabled>停止</button>
+        <button id="clear" class="secondary">清空输出</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>输出</legend>
+      <pre id="output"></pre>
+    </fieldset>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const out = $("output");
+      const btnRun = $("run");
+      const btnStop = $("stop");
+      const btnClear = $("clear");
+      const btnDevices = $("btnDevices");
+      const devicesOut = $("devicesOut");
+      const modeSelect = $("mode");
+      const threadsInput = $("threads");
+
+      // Default: Ultra Fast uses all logical cores for maximum performance
+      const cpuThreads = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 0;
+      function applyDefaultThreads() {
+        if (modeSelect.value === 'ultra-fast') {
+          if (!threadsInput.value) {
+            if (cpuThreads > 0) threadsInput.value = String(cpuThreads);
+            threadsInput.placeholder = '默认=全部线程';
+          }
+        }
+      }
+
+      async function refreshDevices() {
+        devicesOut.textContent = "查询中…";
+        try {
+          const r = await fetch('/api/devices');
+          const j = await r.json();
+          if (!j.ok) throw new Error(j.error || '未知错误');
+          devicesOut.textContent = '可用设备ID: ' + (j.deviceIds?.join(', ') || '无');
+        } catch (e) {
+          devicesOut.textContent = '获取设备失败：' + e.message;
+        }
+      }
+
+      btnDevices.addEventListener('click', (e) => {
+        e.preventDefault();
+        refreshDevices();
+      });
+
+      const btnBrowse = $("btnBrowse");
+      btnBrowse.addEventListener('click', async (e) => {
+        e.preventDefault();
+        try {
+          const res = await fetch('/api/browse-folder');
+          const j = await res.json();
+          if (!res.ok) {
+            if (j && j.error === 'cancelled') return; // user cancelled dialog
+            alert('选择目录失败：' + (j.error || res.statusText));
+            return;
+          }
+          if (j.path) {
+            $("directory").value = j.path;
+          }
+        } catch (err) {
+          alert('请求文件夹选择失败：' + err.message);
+        }
+      });
+
+      function collectPayload() {
+        return {
+          directory: $("directory").value,
+          algorithm: $("algorithm").value,
+          mode: $("mode").value,
+          device: $("device").value,
+          extensions: $("extensions").value,
+          threads: $("threads").value,
+          batch: $("batch").value,
+          quick: $("quick").checked,
+          execute: $("execute").checked,
+          yes: $("execute").checked, // auto-confirm when execute
+          recursive: $("recursive").checked,
+          extreme: $("extreme").checked,
+          gpu_min_kb: $("gpu_min_kb").value,
+          buffer_kb: $("buffer_kb").value,
+          mmap_chunk_mb: $("mmap_chunk_mb").value,
+          gpu_file_cap_mb: $("gpu_file_cap_mb").value,
+          gpu_batch_bytes_mb: $("gpu_batch_bytes_mb").value,
+          gpu_chunk_mb: $("gpu_chunk_mb").value,
+        };
+      }
+
+      function append(text) {
+        out.textContent += text;
+        out.scrollTop = out.scrollHeight;
+      }
+
+      btnClear.addEventListener('click', () => { out.textContent = ''; });
+
+      btnRun.addEventListener('click', async () => {
+        const payload = collectPayload();
+        if (!payload.directory) { alert('请填写目录路径'); return; }
+        out.textContent = '';
+        btnRun.disabled = true; btnStop.disabled = false;
+        try {
+          const res = await fetch('/api/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const j = await res.json().catch(() => ({}));
+            append('启动失败：' + (j.error || res.statusText) + '\n');
+          } else {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              append(decoder.decode(value));
+            }
+          }
+        } catch (e) {
+          append('请求失败：' + e.message + '\n');
+        } finally {
+          btnRun.disabled = false; btnStop.disabled = true;
+        }
+      });
+
+      btnStop.addEventListener('click', async () => {
+        btnStop.disabled = true;
+        try {
+          await fetch('/api/stop', { method: 'POST' });
+        } catch {}
+      });
+
+      // Preload device info
+      refreshDevices();
+
+      // Apply Ultra Fast default threads on load and when mode changes
+      applyDefaultThreads();
+      modeSelect.addEventListener('change', applyDefaultThreads);
+    </script>
+  </body>
+  </html>

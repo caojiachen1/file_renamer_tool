@@ -1831,12 +1831,11 @@ public:
             return;
         }
         
-        // Auto-detect optimal number of threads
+        // Auto-detect threads: use all logical CPU threads by default for ultra-fast
         if (numThreads <= 0) {
-            numThreads = std::thread::hardware_concurrency();
-            if (numThreads <= 0) numThreads = 4;
-            // Use more threads for I/O bound operations
-            numThreads = std::min(numThreads * 2, 32);
+            unsigned hc = std::thread::hardware_concurrency();
+            if (hc == 0) hc = 4;
+            numThreads = hc;
         }
         
     std::cout << "Ultra-fast processing mode enabled!" << std::endl;
@@ -2775,14 +2774,19 @@ int main(int argc, char* argv[]) {
         argGPUChunkMB = extreme ? 32 : 16;
     }
 
-    // Threads/Batches auto when not set by user (maximize throughput)
+    // Threads/Batches auto when not set by user
     if (numThreads <= 0) {
         unsigned hc = std::thread::hardware_concurrency();
         if (hc == 0) hc = 4;
-        // Extreme: up to 4x logical cores cap 96; else 3x cap 64
-        unsigned mult = extreme ? 4u : 3u;
-        unsigned cap = extreme ? 96u : 64u;
-        numThreads = std::min<unsigned>(hc * mult, cap);
+        if (mode == ULTRA_FAST) {
+            // Ultra Fast default: use all logical cores (max performance while preserving fairness)
+            numThreads = hc;
+        } else {
+            // Other modes keep previous aggressive tuning
+            unsigned mult = extreme ? 4u : 3u;
+            unsigned cap = extreme ? 96u : 64u;
+            numThreads = std::min<unsigned>(hc * mult, cap);
+        }
     }
     if (batchSize == 0) {
         // Extreme: 6×threads；否则 4×threads
