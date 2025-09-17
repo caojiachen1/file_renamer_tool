@@ -2465,12 +2465,12 @@ void PrintUsage() {
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
     std::cout << "  -d, --device <id|cpu|auto> Device to use: -1 or 'cpu' for CPU, 0,1,2... for GPU, 'auto' for best available" << std::endl;
     std::cout << "                          Use 'list' to show available devices [default: auto]" << std::endl;
-    std::cout << "  --gpu-min-kb <n>        Minimum file size (KB) to use GPU [default: 4]" << std::endl;
-    std::cout << "  --buffer-kb <n>         Streaming buffer size (KB) for hashing [default: 1024]" << std::endl;
-    std::cout << "  --mmap-chunk-mb <n>     Chunk size (MB) to feed from memory-mapped views [default: 4]" << std::endl;
-    std::cout << "  --gpu-file-cap-mb <n>   Max file size (MB) to load entirely for GPU hashing [default: 64]" << std::endl;
-    std::cout << "  --gpu-batch-bytes-mb <n> Max total bytes (MB) per GPU mini-batch in batch mode [default: 256]" << std::endl;
-    std::cout << "  --gpu-chunk-mb <n>      Single-file CRC32 GPU chunk size (MB) [default: 8]" << std::endl;
+    std::cout << "  --gpu-min-kb <n>        Minimum file size (KB) to use GPU [default: auto(4)]" << std::endl;
+    std::cout << "  --buffer-kb <n>         Streaming buffer size (KB) for hashing [default: auto]" << std::endl;
+    std::cout << "  --mmap-chunk-mb <n>     Chunk size (MB) to feed from memory-mapped views [default: auto]" << std::endl;
+    std::cout << "  --gpu-file-cap-mb <n>   Max file size (MB) to load entirely for GPU hashing [default: auto]" << std::endl;
+    std::cout << "  --gpu-batch-bytes-mb <n> Max total bytes (MB) per GPU mini-batch in batch mode [default: auto]" << std::endl;
+    std::cout << "  --gpu-chunk-mb <n>      Single-file CRC32 GPU chunk size (MB) [default: auto]" << std::endl;
     std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
     std::cout << "  --multi-thread          Use multi-threaded processing [default]" << std::endl;
     std::cout << "  --batch-mode            Use batch processing mode (best for large datasets)" << std::endl;
@@ -2484,6 +2484,7 @@ void PrintUsage() {
     std::cout << std::endl;
     std::cout << "Additional Options:" << std::endl;
     std::cout << "  --ultra-fast            Use ultra-fast processing mode with thread pool" << std::endl;
+    std::cout << "  --extreme               Extreme performance tuning (very high threads/buffers/batches; higher memory usage)" << std::endl;
     std::cout << std::endl;
 #ifdef USE_CUDA
     std::cout << "Device Support:" << std::endl;
@@ -2555,15 +2556,17 @@ int main(int argc, char* argv[]) {
     bool autoConfirm = false; // Auto-confirm without user interaction
     int numThreads = 0; // Auto-detect by default
     size_t batchSize = 0; // Auto-calculate by default
-    size_t argGpuMinKB = 4; // default 4KB threshold
-    size_t argBufferKB = 1024; // default 1MB buffer
-    size_t argMmapChunkMB = 4; // default 4MB
-    size_t argGPUFileCapMB = 64; // default 64MB
-    size_t argGPUBatchBytesMB = 256; // default 256MB
-    size_t argGPUChunkMB = 8; // default 8MB for single-file CRC32 chunking
+    size_t argGpuMinKB = 4; // default auto -> 4KB threshold
+    size_t argBufferKB = 0; // 0 means auto-tune
+    size_t argMmapChunkMB = 0; // 0 means auto-tune
+    size_t argGPUFileCapMB = 0; // 0 means auto-tune
+    size_t argGPUBatchBytesMB = 0; // 0 means auto-tune
+    size_t argGPUChunkMB = 0; // 0 means auto-tune for single-file CRC32 chunking
+    bool userSetGpuMin = false, userSetBuffer = false, userSetMmap = false, userSetGpuFileCap = false, userSetGpuBatch = false, userSetGpuChunk = false;
     enum ProcessingMode { ULTRA_FAST, MULTI_THREAD, BATCH_MODE, SINGLE_THREAD };
     ProcessingMode mode = ULTRA_FAST; // Default to ultra-fast mode
     std::vector<std::string> allowedExtensions;
+    bool extreme = false; // Extreme performance tuning
     
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -2584,6 +2587,8 @@ int main(int argc, char* argv[]) {
             autoConfirm = true;
         } else if (arg == "--ultra-fast") {
             mode = ULTRA_FAST;
+        } else if (arg == "--extreme") {
+            extreme = true;
         } else if (arg == "--single-thread") {
             mode = SINGLE_THREAD;
         } else if (arg == "--multi-thread") {
@@ -2638,26 +2643,32 @@ int main(int argc, char* argv[]) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --gpu-min-kb value" << std::endl; return 1; }
             argGpuMinKB = static_cast<size_t>(v);
+            userSetGpuMin = true;
         } else if (arg == "--buffer-kb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --buffer-kb value" << std::endl; return 1; }
             argBufferKB = static_cast<size_t>(v);
+            userSetBuffer = true;
         } else if (arg == "--mmap-chunk-mb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --mmap-chunk-mb value" << std::endl; return 1; }
             argMmapChunkMB = static_cast<size_t>(v);
+            userSetMmap = true;
         } else if (arg == "--gpu-file-cap-mb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --gpu-file-cap-mb value" << std::endl; return 1; }
             argGPUFileCapMB = static_cast<size_t>(v);
+            userSetGpuFileCap = true;
         } else if (arg == "--gpu-batch-bytes-mb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --gpu-batch-bytes-mb value" << std::endl; return 1; }
             argGPUBatchBytesMB = static_cast<size_t>(v);
+            userSetGpuBatch = true;
         } else if (arg == "--gpu-chunk-mb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --gpu-chunk-mb value" << std::endl; return 1; }
             argGPUChunkMB = static_cast<size_t>(v);
+            userSetGpuChunk = true;
         } else if (directory.empty() && arg[0] != '-') {
             directory = arg;
         } else {
@@ -2690,16 +2701,118 @@ int main(int argc, char* argv[]) {
         selectedDeviceId = std::atoi(deviceSelection.c_str()); // Specific device ID (including -1 for CPU)
     }
     
-    // Apply I/O tuning params
+    // 1) Initialize GPU first to obtain device info (for auto tuning)
+    bool gpuAvailable = FileRenamerCLI::InitializeGPU(selectedDeviceId);
+
+    // 2) Auto-tune defaults if not specified by user
+    //    - Tune by system RAM and GPU VRAM
+    MEMORYSTATUSEX memInfo; memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+    ULONGLONG totalRamMB = 0;
+    if (GlobalMemoryStatusEx(&memInfo)) {
+        totalRamMB = memInfo.ullTotalPhys / (1024ull * 1024ull);
+    }
+
+    // Derive GPU VRAM in MB when available
+    ULONGLONG gpuMemMB = 0;
+#ifdef USE_CUDA
+    if (gpuAvailable) {
+        const auto& gi = CudaHashCalculator::GetGPUInfo();
+        int sel = FileRenamerCLI::GetSelectedDevice();
+        if (sel >= 0 && sel < gi.deviceCount) {
+            gpuMemMB = gi.devices[sel].totalGlobalMem / (1024ull * 1024ull);
+        }
+    }
+#endif
+
+    // Buffer size (favor higher throughput)
+    if (!userSetBuffer) {
+        if (extreme) argBufferKB = (totalRamMB >= 4096 ? 8192 : 4096); // Extreme: 4–8 MB
+        else if (totalRamMB >= 8192) argBufferKB = 4096;               // 4 MB
+        else argBufferKB = 2048;                                       // 2 MB
+    }
+
+    // mmap feed chunk (larger chunks for higher throughput)
+    if (!userSetMmap) {
+        if (extreme) argMmapChunkMB = (totalRamMB >= 4096 ? 32 : 16); // Extreme: 16–32 MB
+        else if (totalRamMB >= 8192) argMmapChunkMB = 16;
+        else argMmapChunkMB = 8;
+    }
+
+    // GPU file cap (allow larger in-memory GPU hashing)
+    if (!userSetGpuFileCap) {
+        if (gpuAvailable && gpuMemMB > 0) {
+            // Extreme: ~1/8 VRAM (256–2048 MB), otherwise ~1/16 (128–1024 MB)
+            if (extreme) {
+                ULONGLONG cap = std::max<ULONGLONG>(256, std::min<ULONGLONG>(2048, gpuMemMB / 8));
+                argGPUFileCapMB = static_cast<size_t>(cap);
+            } else {
+                ULONGLONG cap = std::max<ULONGLONG>(128, std::min<ULONGLONG>(1024, gpuMemMB / 16));
+                argGPUFileCapMB = static_cast<size_t>(cap);
+            }
+        } else {
+            argGPUFileCapMB = extreme ? 256 : 128; // CPU-only default
+        }
+    }
+
+    // GPU batch cap (favor larger batches)
+    if (!userSetGpuBatch) {
+        if (gpuAvailable && gpuMemMB > 0) {
+            // Extreme: ~1/2 VRAM [1024, 12288] MB, otherwise ~1/4 [512, 8192] MB
+            if (extreme) {
+                ULONGLONG cap = std::max<ULONGLONG>(1024, std::min<ULONGLONG>(12288, gpuMemMB / 2));
+                argGPUBatchBytesMB = static_cast<size_t>(cap);
+            } else {
+                ULONGLONG cap = std::max<ULONGLONG>(512, std::min<ULONGLONG>(8192, gpuMemMB / 4));
+                argGPUBatchBytesMB = static_cast<size_t>(cap);
+            }
+        } else {
+            argGPUBatchBytesMB = extreme ? 1024 : 512;
+        }
+    }
+
+    // GPU chunk size (favor larger chunk)
+    if (!userSetGpuChunk) {
+        argGPUChunkMB = extreme ? 32 : 16;
+    }
+
+    // Threads/Batches auto when not set by user (maximize throughput)
+    if (numThreads <= 0) {
+        unsigned hc = std::thread::hardware_concurrency();
+        if (hc == 0) hc = 4;
+        // Extreme: up to 4x logical cores cap 96; else 3x cap 64
+        unsigned mult = extreme ? 4u : 3u;
+        unsigned cap = extreme ? 96u : 64u;
+        numThreads = std::min<unsigned>(hc * mult, cap);
+    }
+    if (batchSize == 0) {
+        // Extreme: 6×threads；否则 4×threads
+        batchSize = std::max<size_t>(1, static_cast<size_t>(numThreads) * (extreme ? 6 : 4));
+    }
+
+    // 3) Apply tuned params
     FileRenamerCLI::SetIOBufferKB(argBufferKB);
     FileRenamerCLI::SetMmapChunkMB(argMmapChunkMB);
     FileRenamerCLI::SetGPUFileCapMB(argGPUFileCapMB);
     FileRenamerCLI::SetGPUBatchBytesMB(argGPUBatchBytesMB);
     FileRenamerCLI::SetGPUChunkMB(argGPUChunkMB);
 
-    bool gpuAvailable = FileRenamerCLI::InitializeGPU(selectedDeviceId);
-    // Apply GPU min threshold after potential initialization changes
+    // Apply GPU min threshold after initialization (allow user override)
+    if (!userSetGpuMin) {
+        // Default 4KB; could bump slightly if VRAM tiny, but keep consistent
+        argGpuMinKB = 4;
+    }
     FileRenamerCLI::SetGPUMinFileSizeBytes(argGpuMinKB * 1024ull);
+
+    // Print final chosen parameters (concise)
+    if (extreme) {
+        std::cout << "Extreme mode enabled (aggressive tuning)." << std::endl;
+    }
+    std::cout << "Auto-tuned parameters:" << std::endl;
+    std::cout << "  Threads: " << numThreads << ", Batch size: " << batchSize << std::endl;
+    std::cout << "  I/O buffer: " << argBufferKB << " KB, mmap chunk: " << argMmapChunkMB << " MB" << std::endl;
+    if (gpuAvailable) {
+        std::cout << "  GPU file-cap: " << argGPUFileCapMB << " MB, batch-cap: " << argGPUBatchBytesMB << " MB, chunk: " << argGPUChunkMB << " MB" << std::endl;
+    }
     
     if (!dryRun) {
         std::cout << "WARNING: This will permanently rename files!" << std::endl;

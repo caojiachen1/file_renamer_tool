@@ -91,8 +91,10 @@ file_renamer.exe <directory> [options]
 - `-r, --recursive` - Scan subdirectories recursively
 - `-e, --execute` - Execute renaming (default is preview mode)
 - `-x, --extensions <ext>` - Only process files with specified extensions
-- `-t, --threads <n>` - Number of processing threads [default: auto-detect]
+- `-t, --threads <n>` - Number of processing threads [default: auto]
 - `-q, --quick` - Enable quick check for already-named files
+- `--ultra-fast` - Enable ultra-fast pipeline (aggressive I/O + scheduling)
+- `--extreme` - Extreme performance mode (very aggressive auto-tuning; higher RAM/VRAM & I/O usage)
 - `-y, --yes` - Auto-confirm without user interaction
 - `-h, --help` - Show help message
 
@@ -153,3 +155,46 @@ file_renamer.exe C:\MyFiles -e -y -q
 The tool processes files as follows:
 1. Original: `document.pdf`
 2. Renamed: `d41d8cd98f00b204e9800998ecf8427e.pdf` (MD5 hash + original extension)
+
+## Auto-tuned Defaults (Fastest by default)
+
+When you don’t specify tuning flags, the tool picks aggressive, high-throughput defaults based on your hardware:
+
+- I/O buffer (`--buffer-kb`): 2–4 MB depending on system RAM (≥8GB → 4MB)
+- mmap feed chunk (`--mmap-chunk-mb`): 8–16 MB depending on system RAM (≥8GB → 16MB)
+- Threads (`-t`): up to 3× logical cores (capped at 64)
+- Batch size (`-b`): 4 × threads
+- GPU per-file in-memory cap (`--gpu-file-cap-mb`): ~1/16 VRAM (128–1024 MB)
+- GPU mini-batch cap (`--gpu-batch-bytes-mb`): ~1/4 VRAM (512–8192 MB)
+- GPU single-file chunk (`--gpu-chunk-mb`): 默认 16 MB
+- GPU min size (`--gpu-min-kb`): 4 KB
+
+You can override any of these at runtime by passing the corresponding flag.
+
+## Extreme mode (--extreme)
+
+For maximum throughput, add `--extreme`. This applies an even more aggressive tuning profile on top of the auto defaults:
+
+- Threads: up to 4× logical cores (capped at 96)
+- Batch size: 6 × threads
+- I/O buffer (`--buffer-kb`): 4–8 MB (RAM-dependent)
+- mmap feed chunk (`--mmap-chunk-mb`): 16–32 MB (RAM-dependent)
+- GPU per-file in-memory cap (`--gpu-file-cap-mb`): ~1/8 VRAM (256–2048 MB)
+- GPU mini-batch cap (`--gpu-batch-bytes-mb`): ~1/2 VRAM (1024–12288 MB)
+- GPU single-file chunk (`--gpu-chunk-mb`): 32 MB
+
+Notes:
+- `--extreme` increases memory and I/O pressure; ensure your system has sufficient RAM/VRAM and fast storage.
+- Any explicit flag you pass (e.g., `-t`, `--buffer-kb`, `--gpu-chunk-mb`) overrides the auto/`--extreme` values.
+
+### Examples
+
+Preview, ultra-fast + extreme, auto device selection:
+```cmd
+file_renamer.exe C:\MyFiles --ultra-fast --extreme -d auto -q -r
+```
+
+Execute on GPU 0 with extreme tuning and SHA256:
+```cmd
+file_renamer.exe C:\MyFiles -a SHA256 -e -r -d 0 --ultra-fast --extreme -y
+```
