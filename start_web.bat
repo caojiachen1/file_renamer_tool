@@ -38,14 +38,14 @@ set PYTHONIOENCODING=utf-8
 @REM   exit /b 1
 @REM )
 
-echo [*] 安装依赖...
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-if errorlevel 1 (
-  echo 依赖安装失败。请检查网络或以管理员身份运行本脚本。
-  pause
-  exit /b 1
-)
+@REM echo [*] 安装依赖...
+@REM python -m pip install --upgrade pip
+@REM python -m pip install -r requirements.txt
+@REM if errorlevel 1 (
+@REM   echo 依赖安装失败。请检查网络或以管理员身份运行本脚本。
+@REM   pause
+@REM   exit /b 1
+@REM )
 
 echo [*] 启动 Web 服务...
 set FLASK_ENV=production

@@ -1198,7 +1198,7 @@ public:
                 return result;
             }
             
-            std::string extension = filePath.extension().string();
+            std::string extension = filePath.extension().u8string();
             std::string newFileName = hash + extension;
             fs::path newPath = filePath.parent_path() / newFileName;
             
@@ -1341,7 +1341,7 @@ public:
     
     // Check if file likely already has correct hash name (quick check)
     static bool QuickHashCheck(const fs::path& filePath, const std::string& algorithm) {
-        std::string stem = filePath.stem().string();
+        std::string stem = filePath.stem().u8string();
         
         // Convert to lowercase for comparison
         std::transform(stem.begin(), stem.end(), stem.begin(), ::tolower);
@@ -1368,7 +1368,7 @@ public:
             return true; // Process all files if no filter specified
         }
         
-        std::string fileExt = filePath.extension().string();
+        std::string fileExt = filePath.extension().u8string();
         
         // Convert to lowercase for case-insensitive comparison
         std::transform(fileExt.begin(), fileExt.end(), fileExt.begin(), ::tolower);
@@ -1396,7 +1396,7 @@ public:
             return true;
         }
         
-        const std::string& fileExt = filePath.extension().string();
+        const std::string& fileExt = filePath.extension().u8string();
         
         // Quick case-insensitive comparison without creating new strings
         for (const auto& ext : allowedExtensions) {
@@ -1521,14 +1521,14 @@ public:
                 std::stringstream buffer; // Local buffer for this file's output
                 
                 try {
-                    std::string fileName = file.filename().string();
+                    std::string fileName = file.filename().u8string();
                     
                     // Build output in local buffer first
                     buffer << "[" << (fileIndex + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
                     
                     // Check if file extension matches filter
                     if (!ShouldProcessFile(file, allowedExtensions)) {
-                        std::string extension = file.extension().string();
+                        std::string extension = file.extension().u8string();
                         buffer << "  Extension: \"" << extension << "\"" << std::endl;
                         buffer << "  Status: Skipped (extension not in filter)" << std::endl;
                         buffer << std::endl;
@@ -1568,7 +1568,7 @@ public:
                         continue;
                     }
                     
-                    std::string extension = file.extension().string();
+                    std::string extension = file.extension().u8string();
                     std::string newFileName = hash + extension;
                     fs::path newPath = file.parent_path() / newFileName;
                     
@@ -1730,12 +1730,12 @@ public:
         
         for (const auto& file : files) {
             try {
-                std::string fileName = file.filename().string();
+                std::string fileName = file.filename().u8string();
                 std::cout << "[" << (processedCount + skippedCount + quickSkipCount + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
                 
                 // Check if file extension matches filter
                 if (!ShouldProcessFile(file, allowedExtensions)) {
-                    std::string extension = file.extension().string();
+                    std::string extension = file.extension().u8string();
                     std::cout << "  Extension: \"" << extension << "\"" << std::endl;
                     std::cout << "  Status: Skipped (extension not in filter)" << std::endl;
                     skippedCount++;
@@ -1767,7 +1767,7 @@ public:
                 continue;
             }
             
-            std::string extension = file.extension().string();
+            std::string extension = file.extension().u8string();
             std::string newFileName = hash + extension;
             fs::path newPath = file.parent_path() / newFileName;
             
@@ -1916,14 +1916,14 @@ public:
                 auto taskStart = std::chrono::steady_clock::now();
                 
                 try {
-                    std::string fileName = file.filename().string();
+                    std::string fileName = file.filename().u8string();
                     
                     // Build output in local buffer
                     buffer << "[" << (i + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
                     
                     // Check if file extension matches filter
                     if (!ShouldProcessFile(file, allowedExtensions)) {
-                        std::string extension = file.extension().string();
+                        std::string extension = file.extension().u8string();
                         buffer << "  Extension: \"" << extension << "\"" << std::endl;
                         buffer << "  Status: Skipped (extension not in filter)" << std::endl;
                         buffer << std::endl;
@@ -1966,7 +1966,7 @@ public:
                         return;
                     }
                     
-                    std::string extension = file.extension().string();
+                    std::string extension = file.extension().u8string();
                     std::string newFileName = hash + extension;
                     fs::path newPath = file.parent_path() / newFileName;
                     
@@ -2249,7 +2249,7 @@ public:
                             }
                             continue;
                         }
-                        std::string extension = file.extension().string();
+                        std::string extension = file.extension().u8string();
                         std::string newFileName = hash + extension;
                         fs::path newPath = file.parent_path() / newFileName;
                         out << "  Hash (" << algorithm << "): " << hash << std::endl;
@@ -2285,14 +2285,14 @@ public:
                     const auto& file = batch[fileIndex];
                     
                     try {
-                        std::string fileName = file.filename().string();
+                        std::string fileName = file.filename().u8string();
                         size_t globalIndex = batchIndex * batchSize + fileIndex;
                         std::stringstream prelude;
                         prelude << "[" << (globalIndex + 1) << "/" << files.size() << "] Batch " << (batchIndex + 1) << "/" << batches.size() << " Processing: \"" << fileName << "\"" << std::endl;
                         
                         // Check if file extension matches filter
                         if (!ShouldProcessFile(file, allowedExtensions)) {
-                            std::string extension = file.extension().string();
+                            std::string extension = file.extension().u8string();
                             prelude << "  Extension: \"" << extension << "\"" << std::endl;
                             prelude << "  Status: Skipped (extension not in filter)" << std::endl << std::endl;
                             skippedCount++;
@@ -2347,7 +2347,7 @@ public:
                                 }
                                 continue;
                             }
-                            std::string extension = file.extension().string();
+                            std::string extension = file.extension().u8string();
                             std::string newFileName = hash + extension;
                             fs::path newPath = file.parent_path() / newFileName;
                             out << "  Hash (" << algorithm << "): " << hash << std::endl;

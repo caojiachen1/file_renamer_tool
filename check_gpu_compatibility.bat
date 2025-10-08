@@ -67,7 +67,7 @@ echo.
 
 :end
 echo.
-echo To build with GPU acceleration: build_cuda.bat
+echo To build with GPU acceleration: build.bat
 echo To build CPU-only version: build.bat
 echo.
 pause
