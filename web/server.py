@@ -109,7 +109,7 @@ def build_args(payload: dict) -> List[str]:
         args += ["-x", exts]
 
     # Device selection
-    device = (payload.get("device") or "auto").strip()
+    device = (payload.get("device") or "cpu").strip()
     if device:
         # normalize values
         dval = device.lower()
@@ -246,7 +246,7 @@ def run_cli():
                     args,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    bufsize=1,
+                    bufsize=-1,
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             except FileNotFoundError:
