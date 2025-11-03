@@ -43,6 +43,6 @@
 build/
 *.md
 !README.md
-.vscode/
+.*/
 
 *test*/

@@ -8,6 +8,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
+import re
 
 from flask import Flask, jsonify, request, Response, send_from_directory
 
@@ -103,10 +104,17 @@ def build_args(payload: dict) -> List[str]:
     if batch:
         args += ["-b", str(int(batch))]
 
-    # Extensions filter (comma separated, keep raw)
-    exts = (payload.get("extensions") or "").strip()
-    if exts:
-        args += ["-x", exts]
+    # Extensions filter (accept comma or whitespace separated; strip leading dots)
+    exts_raw = payload.get("extensions")
+    if exts_raw is not None:
+        exts_s = exts_raw.strip()
+        if exts_s:
+            parts = re.split(r"[,\s]+", exts_s)
+            norm = ",".join(
+                sorted({p.lstrip('.').lower() for p in parts if p})
+            )
+            if norm:
+                args += ["-x", norm]
 
     # Device selection
     device = (payload.get("device") or "cpu").strip()
