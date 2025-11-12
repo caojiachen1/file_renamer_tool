@@ -1,3 +1,25 @@
+# Node / Tauri
+node_modules/
+src-tauri/target/
+target/
+
+# Python venv (if any)
+.venv/
+
+# Build outputs
+build/**/*.ilk
+build/**/*.pdb
+build/**/*.obj
+build/**/*.exe.recipe
+build/**/CMakeFiles/
+build/**/CMakeCache.txt
+build/**/cmake_install.cmake
+build/**/Debug/
+build/**/Release/
+
+# Misc
+*.log
+*.tmp
 # Prerequisites
 *.d
 

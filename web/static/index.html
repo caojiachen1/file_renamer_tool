@@ -153,6 +153,8 @@
     </fieldset>
 
     <script>
+      // Tauri detection (requires tauri.conf.json build.withGlobalTauri=true)
+      const isTauri = typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.invoke;
       const $ = (id) => document.getElementById(id);
       const out = $("output");
       const btnRun = $("run");
@@ -162,6 +164,8 @@
       const devicesOut = $("devicesOut");
       const modeSelect = $("mode");
       const threadsInput = $("threads");
+      let unlistenOutput = null;
+      let unlistenExit = null;
 
       // Default: Ultra Fast uses all logical cores for maximum performance
       const cpuThreads = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 0;
@@ -177,12 +181,18 @@
       async function refreshDevices() {
         devicesOut.textContent = "查询中…";
         try {
-          const r = await fetch('/api/devices');
-          const j = await r.json();
+          let j;
+          if (isTauri) {
+            j = await window.__TAURI__.invoke('list_devices');
+          } else {
+            const r = await fetch('/api/devices');
+            j = await r.json();
+          }
           if (!j.ok) throw new Error(j.error || '未知错误');
           devicesOut.textContent = '可用设备ID: ' + (j.deviceIds?.join(', ') || '无');
         } catch (e) {
-          devicesOut.textContent = '获取设备失败：' + e.message;
+          const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+          devicesOut.textContent = '获取设备失败：' + msg;
         }
       }
 
@@ -195,18 +205,24 @@
       btnBrowse.addEventListener('click', async (e) => {
         e.preventDefault();
         try {
-          const res = await fetch('/api/browse-folder');
-          const j = await res.json();
-          if (!res.ok) {
-            if (j && j.error === 'cancelled') return; // user cancelled dialog
-            alert('选择目录失败：' + (j.error || res.statusText));
-            return;
-          }
-          if (j.path) {
-            $("directory").value = j.path;
+          if (isTauri) {
+            const sel = await window.__TAURI__.dialog.open({ directory: true, multiple: false });
+            if (sel) { $("directory").value = Array.isArray(sel) ? sel[0] : sel; }
+          } else {
+            const res = await fetch('/api/browse-folder');
+            const j = await res.json();
+            if (!res.ok) {
+              if (j && j.error === 'cancelled') return; // user cancelled dialog
+              alert('选择目录失败：' + (j.error || res.statusText));
+              return;
+            }
+            if (j.path) {
+              $("directory").value = j.path;
+            }
           }
         } catch (err) {
-          alert('请求文件夹选择失败：' + err.message);
+          const msg = (err && err.message) ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
+          alert('请求文件夹选择失败：' + msg);
         }
       });
 
@@ -246,39 +262,66 @@
         out.textContent = '';
         btnRun.disabled = true; btnStop.disabled = false;
         try {
-          const res = await fetch('/api/run', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (!res.ok) {
-            const j = await res.json().catch(() => ({}));
-            append('启动失败：' + (j.error || res.statusText) + '\n');
+          if (isTauri) {
+            // attach listeners once
+            if (!unlistenOutput) {
+              unlistenOutput = await window.__TAURI__.event.listen('cli-output', (e) => {
+                if (typeof e.payload === 'string') append(e.payload);
+              });
+            }
+            if (!unlistenExit) {
+              unlistenExit = await window.__TAURI__.event.listen('cli-exit', (_e) => {
+                btnRun.disabled = false; btnStop.disabled = true;
+              });
+            }
+            // Tauri invoke requires named arguments matching Rust command parameters
+            await window.__TAURI__.invoke('start_run', { payload });
           } else {
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              append(decoder.decode(value));
+            const res = await fetch('/api/run', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            if (!res.ok) {
+              const j = await res.json().catch(() => ({}));
+              append('启动失败：' + (j.error || res.statusText) + '\n');
+            } else {
+              const reader = res.body.getReader();
+              const decoder = new TextDecoder('utf-8');
+              while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                append(decoder.decode(value));
+              }
             }
           }
         } catch (e) {
-          append('请求失败：' + e.message + '\n');
+          const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
+          append('请求失败：' + msg + '\n');
         } finally {
-          btnRun.disabled = false; btnStop.disabled = true;
+          if (!isTauri) { btnRun.disabled = false; btnStop.disabled = true; }
         }
       });
 
       btnStop.addEventListener('click', async () => {
         btnStop.disabled = true;
         try {
-          await fetch('/api/stop', { method: 'POST' });
+          if (isTauri) {
+            await window.__TAURI__.invoke('stop_run');
+          } else {
+            await fetch('/api/stop', { method: 'POST' });
+          }
         } catch {}
       });
 
-      // Preload device info
-      refreshDevices();
+  // 不在启动时自动查询设备，避免某些环境下初次调用阻塞 UI。
+  // 用户可手动点击“刷新”按钮触发。
+
+      // Cleanup listeners when closing
+      window.addEventListener('beforeunload', () => {
+        try { if (unlistenOutput) { unlistenOutput(); unlistenOutput = null; } } catch {}
+        try { if (unlistenExit) { unlistenExit(); unlistenExit = null; } } catch {}
+      });
 
       // Apply Ultra Fast default threads on load and when mode changes
       applyDefaultThreads();

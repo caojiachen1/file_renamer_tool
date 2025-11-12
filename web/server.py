@@ -18,12 +18,20 @@ app = Flask(__name__, static_folder=str(Path(__file__).parent / "static"), stati
 
 # --- Locate executable -------------------------------------------------------
 def find_executable() -> Optional[Path]:
+    # 1) environment override
+    env_path = os.environ.get("FILE_RENAMER_EXE")
+    if env_path:
+        p = Path(env_path)
+        if p.exists():
+            return p
+
     here = Path(__file__).resolve().parent.parent  # repo root
     candidates = [
         here / "file_renamer.exe",
         here / "file_renamer_cli.exe",
         here / "build" / "Release" / "file_renamer_cli.exe",
         here / "build" / "Debug" / "file_renamer_cli_d.exe",
+        here / "build" / "Release" / "file_renamer.exe",
     ]
     for c in candidates:
         if c.exists():
@@ -219,19 +227,25 @@ def browse_folder():
 
 
 def stream_process(proc: subprocess.Popen):
+    stdout = proc.stdout
     try:
-        for line in iter(proc.stdout.readline, b""):
-            if not line:
-                break
-            try:
-                chunk = line.decode("utf-8", errors="ignore")
-            except Exception:
-                chunk = line.decode(errors="ignore")
-            yield chunk
+        if stdout is not None:
+            for raw in iter(stdout.readline, b""):
+                if not raw:
+                    break
+                try:
+                    chunk = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    chunk = raw.decode(errors="ignore")
+                yield chunk
         proc.wait()
         yield f"\n[exit-code] {proc.returncode}\n"
     finally:
-        proc.stdout and proc.stdout.close()
+        if stdout is not None:
+            try:
+                stdout.close()
+            except Exception:
+                pass
 
 
 @app.post("/api/run")

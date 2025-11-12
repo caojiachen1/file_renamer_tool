@@ -94,7 +94,7 @@ file_renamer.exe <directory> [options]
 - `-t, --threads <n>` - Number of processing threads [default: auto]
 - `-q, --quick` - Enable quick check for already-named files
 - `--ultra-fast` - Enable ultra-fast pipeline (aggressive I/O + scheduling)
-   - 默认会使用机器的全部逻辑CPU线程以获得最大吞吐（可用 `-t` 手动指定覆盖）
+   - By default uses ALL logical CPU threads for maximum throughput (you can override with `-t`)
 - `--extreme` - Extreme performance mode (very aggressive auto-tuning; higher RAM/VRAM & I/O usage)
 - `-y, --yes` - Auto-confirm without user interaction
 - `-h, --help` - Show help message
@@ -167,7 +167,7 @@ When you don’t specify tuning flags, the tool picks aggressive, high-throughpu
 - Batch size (`-b`): 4 × threads
 - GPU per-file in-memory cap (`--gpu-file-cap-mb`): ~1/16 VRAM (128–1024 MB)
 - GPU mini-batch cap (`--gpu-batch-bytes-mb`): ~1/4 VRAM (512–8192 MB)
-- GPU single-file chunk (`--gpu-chunk-mb`): 默认 16 MB
+- GPU single-file chunk (`--gpu-chunk-mb`): default 16 MB
 - GPU min size (`--gpu-min-kb`): 4 KB
 
 You can override any of these at runtime by passing the corresponding flag.
@@ -195,43 +195,43 @@ Preview, ultra-fast + extreme, auto device selection:
 file_renamer.exe C:\MyFiles --ultra-fast --extreme -d auto -q -r
 ```
 
-Note: Ultra-fast 模式在未显式指定 `-t` 时将默认使用机器全部逻辑线程数（`std::thread::hardware_concurrency()`）。
+Note: In ultra-fast mode, if you do not explicitly specify `-t`, the tool will default to using ALL logical CPU threads (`std::thread::hardware_concurrency()`).
 
 Execute on GPU 0 with extreme tuning and SHA256:
 ```cmd
 file_renamer.exe C:\MyFiles -a SHA256 -e -r -d 0 --ultra-fast --extreme -y
 ```
 
-## Web 界面（本地）
+## Web Interface (Local)
 
-项目包含一个简洁的本地 Web UI，方便可视化配置与运行：
+The project includes a simple local Web UI for visual configuration and execution.
 
-### 启动（Windows）
+### Launch (Windows)
 
-1. 运行 `start_web.bat`（双击或在命令行）。
-   - 自动创建 `.venv` 虚拟环境
-   - 安装依赖（Flask）
-   - 启动 Web 服务（默认 http://127.0.0.1:5000）
-2. 打开浏览器访问 `http://127.0.0.1:5000`。
-3. 在页面中填写：目录路径、算法、模式、设备（auto/CPU/GPU id），是否递归，是否执行（默认预览）、线程/批大小、扩展名过滤，以及可选高级参数。
-4. 点击“运行”查看流式输出；可随时“停止”。
+1. Run `start_web.bat` (double-click or from the command line):
+   - Automatically creates a `.venv` virtual environment
+   - Installs dependencies (Flask)
+   - Starts the web server (default http://127.0.0.1:5000)
+2. Open your browser at `http://127.0.0.1:5000`.
+3. Fill in: directory path, algorithm, mode, device (auto / CPU / GPU id), recursive option, execute (default is preview), threads / batch size, extension filters, and optional advanced parameters.
+4. Click "Run" to view streaming output; you can click "Stop" at any time.
 
-设备列表：点击页面“刷新”按钮将调用 `-d list` 并展示可用设备 ID。
+Device list: Clicking the "Refresh" button triggers `-d list` and displays available device IDs.
 
-### 可执行文件查找顺序
+### Executable Lookup Order
 
-Web 后端会按顺序寻找下列可执行文件：
+The web backend searches for an executable in the following order:
 
 1. `file_renamer.exe`
 2. `file_renamer_cli.exe`
 3. `build/Release/file_renamer_cli.exe`
 4. `build/Debug/file_renamer_cli_d.exe`
 
-若均不存在，会在界面与接口报错提示。
+If none are found, an error will be shown in the UI and API response.
 
-### 自定义监听
+### Custom Host/Port
 
-默认监听 127.0.0.1:5000。若要修改：
+Default bind is 127.0.0.1:5000. To modify:
 
 ```cmd
 set HOST=0.0.0.0
@@ -239,4 +239,53 @@ set PORT=6000
 start_web.bat
 ```
 
-注意：对外开放时请注意网络环境与权限控制。
+Note: When exposing externally, ensure proper network environment and access control.
+
+## Desktop Edition (Tauri)
+
+In addition to the local Flask-based Web UI, you can package a native desktop application using Tauri (Windows executable with windowing, system dialogs, and automated packaging).
+
+### Feature Mapping
+The desktop app reuses the `web/static/index.html` frontend and auto-detects if it runs inside a Tauri environment:
+
+- Directory selection: native folder chooser (Tauri dialog API)
+- Device list: `list_devices` command invokes CLI `-d list`
+- Start task: `start_run` command launches a child process and streams output via `cli-output` events
+- Stop task: `stop_run` command terminates the child process
+- Exit code: `cli-exit` event returns the process exit code
+
+If not running in Tauri (e.g. still served by Flask), the frontend automatically falls back to the original HTTP endpoints without manual switching.
+
+### Development Run (Windows)
+Prerequisites:
+
+1. Install Node.js (>=16) and npm
+2. Install Rust (recommend rustup) and ensure `cargo` is on PATH
+3. Build or have an existing executable: `file_renamer.exe` / `file_renamer_cli.exe` etc. (used for actual work)
+
+Launch the development window:
+
+1. `npm install` to install `@tauri-apps/cli`
+2. `npm run dev` to start the Tauri development window (loading `web/static/index.html`)
+
+### Build Release Package
+
+```cmd
+npm run build
+```
+
+The generated installer / executables are located under `src-tauri/target/release` (plus the `target` cache directory). If you need a WiX installer, install the WiX Toolset per Tauri docs; or adjust `bundle.targets` in `tauri.conf.json` to exclude the installer target.
+
+### Structure Overview
+
+```
+src-tauri/
+   Cargo.toml          # Rust project & Tauri dependencies
+   tauri.conf.json     # Tauri config (distDir points to web/static)
+   src/main.rs         # Backend command implementations (which_exe, list_devices, start_run, stop_run)
+package.json          # Provides Tauri dev/build scripts
+```
+
+### Security Notes
+The desktop edition directly invokes the local CLI and can access user-specified directories. Do not place untrusted external executables in the same directory where they could be mistakenly invoked.
+

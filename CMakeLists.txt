@@ -84,7 +84,7 @@ if(USE_CUDA)
     # CUDA特定编译选项 - 支持多种GPU架构
     # 包括从Maxwell到最新Blackwell架构的广泛GPU支持
     set_target_properties(file_renamer_cli PROPERTIES 
-        CUDA_ARCHITECTURES "50;52;60;61;70;75;80;86;87;89;90"  # 支持Maxwell到Blackwell架构
+        CUDA_ARCHITECTURES "80;86;87;89;90;120"  # 支持Ampere到Blackwell架构
         CUDA_RUNTIME_LIBRARY Static
         CUDA_RESOLVE_DEVICE_SYMBOLS OFF
     )
