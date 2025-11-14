@@ -30,16 +30,25 @@ The unified executable `file_renamer.exe` supports intelligent device selection:
 - CMake 3.20 or later
 - **Optional**: NVIDIA GPU with CUDA support (GTX 900 series or newer) for GPU acceleration
 
-## GPU Support
+## GPU / CUDA Support Status (cuda-legacy branch)
 
-This tool supports CUDA GPU acceleration for faster hash computation on large files:
+This branch (`cuda-legacy`) keeps the original CUDA-based GPU implementation **for archival and experimental purposes only**.
 
-- **Supported GPUs**: NVIDIA GTX 900 series and newer (compute capability 5.0+)
-- **Performance**: 2-10x faster hash calculation for large files
-- **Auto-fallback**: Automatically uses CPU if GPU is unavailable
-- **Supported Architectures**: Maxwell, Pascal, Volta, Turing, Ampere, Ada Lovelace, Blackwell
+- The CUDA pipeline is **known to be significantly slower than the optimized CPU path** on most real-world workloads.
+- Under certain patterns (many small files, mixed sizes, long-running sessions), throughput can degrade over time even when the GPU appears fully utilized.
+- No further performance tuning or bug fixing is planned for the CUDA implementation in this branch.
 
-To check GPU compatibility:
+As a result:
+
+- The **main branch** will move to a **CPU-only** design and no longer ship CUDA support by default.
+- This `cuda-legacy` branch exists so that advanced users can study or experiment with the previous GPU implementation if they really need to.
+
+If you decide to build and run CUDA in this branch anyway:
+
+- Make sure you have a compatible NVIDIA GPU and recent drivers installed.
+- Expect that the CPU path may still outperform the GPU path in many scenarios.
+
+To check GPU compatibility (if you still want to try CUDA on this branch):
 ```cmd
 check_gpu_compatibility.bat
 ```
