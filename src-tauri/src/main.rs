@@ -230,12 +230,8 @@ struct RunPayload {
     yes: Option<bool>,
     recursive: Option<bool>,
     extreme: Option<bool>,
-    gpu_min_kb: Option<String>,
     buffer_kb: Option<String>,
     mmap_chunk_mb: Option<String>,
-    gpu_file_cap_mb: Option<String>,
-    gpu_batch_bytes_mb: Option<String>,
-    gpu_chunk_mb: Option<String>,
 }
 
 fn add_opt(args: &mut Vec<String>, key: Option<String>, flag: &str) {
@@ -294,12 +290,8 @@ fn build_args(exe: &Path, p: &RunPayload) -> anyhow::Result<Vec<String>> {
 
     if p.extreme.unwrap_or(false) { args.push("--extreme".into()); }
 
-    add_opt(&mut args, p.gpu_min_kb.clone(), "--gpu-min-kb");
     add_opt(&mut args, p.buffer_kb.clone(), "--buffer-kb");
     add_opt(&mut args, p.mmap_chunk_mb.clone(), "--mmap-chunk-mb");
-    add_opt(&mut args, p.gpu_file_cap_mb.clone(), "--gpu-file-cap-mb");
-    add_opt(&mut args, p.gpu_batch_bytes_mb.clone(), "--gpu-batch-bytes-mb");
-    add_opt(&mut args, p.gpu_chunk_mb.clone(), "--gpu-chunk-mb");
 
     Ok(args)
 }

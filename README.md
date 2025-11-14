@@ -1,6 +1,6 @@
-# File Renamer Tool - Unified CLI Edition
+# File Renamer Tool - CLI Edition
 
-A command-line utility for batch renaming files using hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B). This tool helps organize files by renaming them with their hash values while preserving file extensions. Features unified CPU/GPU processing with intelligent device selection.
+A command-line utility for batch renaming files using hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B). This tool helps organize files by renaming them with their hash values while preserving file extensions.
 
 ## Features
 
@@ -12,22 +12,9 @@ A command-line utility for batch renaming files using hash algorithms (MD5, SHA1
 - **Multi-threading**: Optimized CPU processing with configurable thread count
 - **Cross-platform**: Windows support with Visual Studio 2022
 
-## CPU-only Focus and CUDA Deprecation
-
-The **main branch** of this project is now **CPU-only** and no longer ships a maintained CUDA implementation.
-
-- Earlier versions experimented with a CUDA-based GPU pipeline.
-- In real-world workloads, the CUDA path often performed **significantly worse than the optimized CPU path** and could degrade over time, even when the GPU appeared fully utilized.
-- To reduce complexity and improve reliability, the project has been refocused entirely on a fast, robust CPU pipeline.
-
-If you are looking for the historical CUDA implementation for research or experimentation, please check the `cuda-legacy` branch:
-
-- `main`: CPU-only, actively maintained, recommended for all users.
-- `cuda-legacy`: Archived experimental CUDA implementation, **no longer tuned or supported**.
-
 ## Device Selection
 
-The unified executable `file_renamer.exe` runs on CPU. Any previous GPU device selection flags are deprecated and may be removed in future versions.
+The executable `file_renamer.exe` runs on CPU. Device selection flags allow you to choose CPU, auto selection, or list devices.
 
 ## Requirements
 
@@ -35,36 +22,19 @@ The unified executable `file_renamer.exe` runs on CPU. Any previous GPU device s
 - Visual Studio 2022 with C++ development tools
 - CMake 3.20 or later
 
-> Note: CUDA / NVIDIA GPU is **no longer required** or used on the main branch. For the historical CUDA pipeline, see the `cuda-legacy` branch.
-
 ## Quick Start
 
 ### Building
 
-#### Unified Build (Recommended)
-1. Clone or download this repository
-2. Check GPU compatibility (optional):
-   ```cmd
-   check_gpu_compatibility.bat
-   ```
-3. Build unified executable:
-   ```cmd
-   build.bat
-   ```
-   This creates `file_renamer.exe` with automatic CUDA support detection.
-
-#### Option 2: CPU-Only Version
 1. Clone or download this repository
 2. Run the build script:
    ```cmd
    build.bat
    ```
 
-**Note**: The GPU version automatically falls back to CPU processing if no compatible GPU is found.
-
 ### Usage
 
-The unified `file_renamer.exe` supports intelligent device selection:
+`file_renamer.exe` supports device selection:
 
 ```cmd
 file_renamer.exe <directory> [options]
@@ -72,11 +42,11 @@ file_renamer.exe <directory> [options]
 
 #### Device Selection Options
 
-- `-d, --device <specification>` - Choose processing device:
-  - `auto` - Auto-select best available device (default)
-  - `cpu` or `-1` - Force CPU processing
-  - `0`, `1`, `2`, ... - Use specific GPU device
-  - `list` - Show all available devices
+- `-d, --device <specification>` - Choose processing mode:
+   - `auto` - Auto-select (default)
+   - `cpu` or `-1` - Force CPU processing
+   - `0`, `1`, `2`, ... - Reserved numeric ids (mapped internally)
+   - `list` - Show available logical devices
 
 #### Core Options
 
@@ -106,7 +76,7 @@ file_renamer.exe C:\MyFiles
 file_renamer.exe C:\MyFiles -d cpu
 file_renamer.exe C:\MyFiles -d -1
 
-# Use specific GPU device
+# Use specific numeric id
 file_renamer.exe C:\MyFiles -d 0
 file_renamer.exe C:\MyFiles -d 1 -a SHA256
 ```
@@ -119,7 +89,7 @@ file_renamer.exe C:\MyFiles
 # Preview only jpg and png files
 file_renamer.exe C:\MyFiles -x jpg,png
 
-# Execute renaming with SHA256, recursive, using GPU device 0
+# Execute renaming with SHA256, recursive, using id 0
 file_renamer.exe C:\MyFiles -a SHA256 -r -e -d 0
 
 # Execute renaming for txt files using CPU, 8 threads
@@ -131,7 +101,7 @@ file_renamer.exe C:\MyFiles -e -y -q
 
 ## How It Works
 
-1. **Device Selection**: Automatically detects available devices (CPU + GPU)
+1. **Device Selection**: Automatically handles device selection
 2. **Scan**: The tool scans the specified directory for files
 3. **Filter**: Applies extension filters if specified
 4. **Hash**: Calculates the hash value using selected device (CPU or GPU)
@@ -158,10 +128,6 @@ When you don’t specify tuning flags, the tool picks aggressive, high-throughpu
 - mmap feed chunk (`--mmap-chunk-mb`): 8–16 MB depending on system RAM (≥8GB → 16MB)
 - Threads (`-t`): up to 3× logical cores (capped at 64)
 - Batch size (`-b`): 4 × threads
-- GPU per-file in-memory cap (`--gpu-file-cap-mb`): ~1/16 VRAM (128–1024 MB)
-- GPU mini-batch cap (`--gpu-batch-bytes-mb`): ~1/4 VRAM (512–8192 MB)
-- GPU single-file chunk (`--gpu-chunk-mb`): default 16 MB
-- GPU min size (`--gpu-min-kb`): 4 KB
 
 You can override any of these at runtime by passing the corresponding flag.
 
@@ -173,13 +139,10 @@ For maximum throughput, add `--extreme`. This applies an even more aggressive tu
 - Batch size: 6 × threads
 - I/O buffer (`--buffer-kb`): 4–8 MB (RAM-dependent)
 - mmap feed chunk (`--mmap-chunk-mb`): 16–32 MB (RAM-dependent)
-- GPU per-file in-memory cap (`--gpu-file-cap-mb`): ~1/8 VRAM (256–2048 MB)
-- GPU mini-batch cap (`--gpu-batch-bytes-mb`): ~1/2 VRAM (1024–12288 MB)
-- GPU single-file chunk (`--gpu-chunk-mb`): 32 MB
 
 Notes:
-- `--extreme` increases memory and I/O pressure; ensure your system has sufficient RAM/VRAM and fast storage.
-- Any explicit flag you pass (e.g., `-t`, `--buffer-kb`, `--gpu-chunk-mb`) overrides the auto/`--extreme` values.
+- `--extreme` increases memory and I/O pressure; ensure your system has sufficient RAM and fast storage.
+- Any explicit flag you pass (e.g., `-t`, `--buffer-kb`) overrides the auto/`--extreme` values.
 
 ### Examples
 
@@ -190,7 +153,7 @@ file_renamer.exe C:\MyFiles --ultra-fast --extreme -d auto -q -r
 
 Note: In ultra-fast mode, if you do not explicitly specify `-t`, the tool will default to using ALL logical CPU threads (`std::thread::hardware_concurrency()`).
 
-Execute on GPU 0 with extreme tuning and SHA256:
+Execute on id 0 with extreme tuning and SHA256:
 ```cmd
 file_renamer.exe C:\MyFiles -a SHA256 -e -r -d 0 --ultra-fast --extreme -y
 ```

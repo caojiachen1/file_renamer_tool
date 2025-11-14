@@ -773,36 +773,9 @@ public:
         return ss.str();
     }
     
-    // Generic hash calculation dispatcher with GPU acceleration
+    // Generic hash calculation dispatcher (CPU-only in main branch)
     static std::string CalculateHash(const std::vector<BYTE>& data, const std::string& algorithm) {
-        // Initialize GPU if not already done
-        if (!gpuInitialized) {
-            InitializeGPU(-2); // Use auto-selection
-        }
-        
-        // Try GPU acceleration for supported algorithms and large files
-        if (ShouldUseGPU(data.size())) {
-#ifdef USE_CUDA
-            std::vector<unsigned char> gpu_data(data.begin(), data.end());
-            
-            if (algorithm == "MD5") {
-                std::string result = CudaHashCalculator::CalculateMD5_GPU(gpu_data);
-                if (!result.empty()) return result;
-            } else if (algorithm == "SHA1") {
-                std::string result = CudaHashCalculator::CalculateSHA1_GPU(gpu_data);
-                if (!result.empty()) return result;
-            } else if (algorithm == "SHA256") {
-                std::string result = CudaHashCalculator::CalculateSHA256_GPU(gpu_data);
-                if (!result.empty()) return result;
-            } else if (algorithm == "CRC32") {
-                std::string result = CudaHashCalculator::CalculateCRC32_GPU(gpu_data);
-                if (!result.empty()) return result;
-            }
-            // Fall back to CPU if GPU fails
-#endif
-        }
-        
-        // CPU fallback
+        // CPU-only implementation
         if (algorithm == "MD5") {
             return CalculateMD5(data);
         } else if (algorithm == "SHA1") {
@@ -2130,15 +2103,11 @@ public:
     std::cout << "Batch size: " << batchSize << std::endl;
     std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
         
-        // Display device status
+        // Display device status (CPU-only in main branch)
         if (!gpuInitialized) {
-            InitializeGPU(-2); // Use auto-selection
+            InitializeGPU(-1); // Force CPU-only mode
         }
-        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
-        if (useGPU) {
-            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
-            std::cout << "GPU batch cap: " << gpuBatchBytesMB << " MB" << std::endl;
-        }
+        std::cout << "Processing device: CPU (CUDA/GPU support removed in main branch)" << std::endl;
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -2209,75 +2178,8 @@ public:
                 
                 const auto& batch = batches[batchIndex];
                 
-                struct GpuCandidate { size_t fileIndex; fs::path path; uintmax_t fileSize; std::string prelude; };
-                std::vector<GpuCandidate> gpuCandidates;
-                size_t gpuBytesAccum = 0;
+                // CPU-only: GPU batch path removed; flushGpu is a no-op placeholder.
                 auto flushGpu = [&]() {
-#ifdef USE_CUDA
-                    if (!useGPU || gpuCandidates.empty() || !IsGPUSupportedAlgorithm(algorithm)) { gpuCandidates.clear(); gpuBytesAccum = 0; return; }
-                    // Build data list within cap
-                    std::vector<std::vector<unsigned char>> dataList;
-                    dataList.reserve(gpuCandidates.size());
-                    std::vector<bool> ok(gpuCandidates.size(), false);
-                    for (size_t k = 0; k < gpuCandidates.size(); ++k) {
-                        auto d = ReadFileEntireWin(gpuCandidates[k].path);
-                        if (!d.empty() || gpuCandidates[k].fileSize == 0) { ok[k] = true; dataList.emplace_back(std::move(d)); }
-                        else { dataList.emplace_back(); }
-                    }
-                    std::vector<std::string> hashes;
-                    if (algorithm == "MD5") hashes = CudaHashCalculator::CalculateBatchMD5_GPU(dataList);
-                    else if (algorithm == "SHA1") hashes = CudaHashCalculator::CalculateBatchSHA1_GPU(dataList);
-                    else if (algorithm == "SHA256") hashes = CudaHashCalculator::CalculateBatchSHA256_GPU(dataList);
-                    else if (algorithm == "CRC32") hashes = CudaHashCalculator::CalculateBatchCRC32_GPU(dataList);
-                    // Emit results per candidate (fallback to CPU if needed)
-                    for (size_t k = 0; k < gpuCandidates.size(); ++k) {
-                        const auto& file = batch[gpuCandidates[k].fileIndex];
-                        std::stringstream out;
-                        out << gpuCandidates[k].prelude;
-                        std::string hash;
-                        if (k < hashes.size() && !hashes[k].empty() && ok[k]) {
-                            hash = hashes[k];
-                        } else {
-                            // CPU fallback
-                            hash = CalculateFileHashOptimized(file, algorithm);
-                        }
-                        if (hash.empty()) {
-                            out << "  Error: Could not calculate hash" << std::endl << std::endl;
-                            {
-                                std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << out.str();
-                            }
-                            continue;
-                        }
-                        std::string extension = file.extension().u8string();
-                        std::string newFileName = hash + extension;
-                        fs::path newPath = file.parent_path() / newFileName;
-                        out << "  Hash (" << algorithm << "): " << hash << std::endl;
-                        out << "  New name: " << newFileName << std::endl;
-                        if (file.filename() == newFileName) {
-                            out << "  Status: No change needed (filename already matches hash)" << std::endl << std::endl;
-                            noChangeCount++;
-                        } else if (!dryRun) {
-                            if (RenameFile(file, newPath)) {
-                                out << "  Status: Renamed successfully" << std::endl << std::endl;
-                                successCount++;
-                            } else {
-                                out << "  Status: Failed to rename" << std::endl << std::endl;
-                            }
-                        } else {
-                            out << "  Status: Preview only (will be renamed)" << std::endl << std::endl;
-                        }
-                        processedCount++;
-                        {
-                            std::lock_guard<std::mutex> lock(outputMutex);
-                            std::cout << out.str();
-                        }
-                    }
-                    gpuCandidates.clear();
-                    gpuBytesAccum = 0;
-#else
-                    (void)gpuCandidates; (void)gpuBytesAccum; // suppress unused warnings
-#endif
                 };
                 
                 // Process all files in this batch
@@ -2314,27 +2216,7 @@ public:
                             continue;
                         }
                         
-                        // Decide GPU vs CPU path in batch mode
-                        bool tryGPU = false;
-                        uintmax_t fsize = 0;
-                        std::error_code fec;
-                        fsize = fs::file_size(file, fec);
-                        if (!fec) {
-                            tryGPU = useGPU && IsGPUSupportedAlgorithm(algorithm) && fsize >= gpuMinFileSize && fsize <= (gpuFileCapMB * 1024ull * 1024ull);
-                        }
-                        if (tryGPU) {
-                            // Queue for GPU mini-batch; flush if exceeds cap
-                            size_t capBytes = gpuBatchBytesMB * 1024ull * 1024ull;
-                            if (gpuBytesAccum + static_cast<size_t>(fsize) > capBytes && !gpuCandidates.empty()) {
-                                flushGpu();
-                            }
-                            GpuCandidate gc{fileIndex, file, fsize, prelude.str()};
-                            gpuBytesAccum += static_cast<size_t>(fsize);
-                            gpuCandidates.emplace_back(std::move(gc));
-                            continue;
-                        }
-                        
-                        // CPU path immediate
+                        // CPU-only: always process immediately on CPU in main branch
                         {
                             std::string hash = CalculateFileHashOptimized(file, algorithm);
                             std::stringstream out;
@@ -2435,16 +2317,16 @@ public:
 // Static member definition
 const char FileRenamerCLI::HEX_CHARS[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
 
-// GPU-related static member definitions
+// GPU-related static member definitions (kept for CLI flags compatibility, but CPU-only in main branch)
 bool FileRenamerCLI::gpuInitialized = false;
 bool FileRenamerCLI::useGPU = false;
 size_t FileRenamerCLI::gpuMinFileSize = 4096;
 int FileRenamerCLI::selectedDevice = -1;
 size_t FileRenamerCLI::ioBufferKB = 1024;   // 1MB default streaming buffer
 size_t FileRenamerCLI::mmapChunkMB = 4;     // 4MB default mmap feed chunk
-size_t FileRenamerCLI::gpuFileCapMB = 64;   // 64MB default cap for GPU in-memory hashing
-size_t FileRenamerCLI::gpuBatchBytesMB = 256; // 256MB default GPU mini-batch cap
-size_t FileRenamerCLI::gpuChunkMB = 8;      // 8MB default single-file CRC32 GPU chunk size
+size_t FileRenamerCLI::gpuFileCapMB = 64;   // 64MB default cap for GPU in-memory hashing (unused)
+size_t FileRenamerCLI::gpuBatchBytesMB = 256; // 256MB default GPU mini-batch cap (unused)
+size_t FileRenamerCLI::gpuChunkMB = 8;      // 8MB default single-file CRC32 GPU chunk size (unused)
 
 void PrintUsage() {
     std::cout << "File Batch Renamer Tool" << std::endl;
@@ -2688,20 +2570,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Initialize processing device with device selection
-    std::cout << "Initializing File Renamer Tool..." << std::endl;
-    int selectedDeviceId = -2; // Default to auto
-    
-    if (deviceSelection == "cpu") {
-        selectedDeviceId = -1; // Force CPU
-    } else if (deviceSelection == "auto") {
-        selectedDeviceId = -2; // Auto-select best device
-    } else {
-        selectedDeviceId = std::atoi(deviceSelection.c_str()); // Specific device ID (including -1 for CPU)
+    // Initialize processing device (CPU-only in main branch)
+    std::cout << "Initializing File Renamer Tool (CPU-only, CUDA removed)..." << std::endl;
+    // Ignore deviceSelection for now, but keep parsing for backward compatibility
+    if (!deviceSelection.empty() && deviceSelection != "cpu" && deviceSelection != "-1" && deviceSelection != "auto") {
+        std::cout << "Note: GPU/CUDA device selection is no longer supported; running on CPU instead." << std::endl;
     }
-    
-    // 1) Initialize GPU first to obtain device info (for auto tuning)
-    bool gpuAvailable = FileRenamerCLI::InitializeGPU(selectedDeviceId);
+    bool gpuAvailable = false; // Always false in CPU-only build
 
     // 2) Auto-tune defaults if not specified by user
     //    - Tune by system RAM and GPU VRAM
@@ -2711,17 +2586,8 @@ int main(int argc, char* argv[]) {
         totalRamMB = memInfo.ullTotalPhys / (1024ull * 1024ull);
     }
 
-    // Derive GPU VRAM in MB when available
+    // Derive GPU VRAM in MB when available (CPU-only: always 0)
     ULONGLONG gpuMemMB = 0;
-#ifdef USE_CUDA
-    if (gpuAvailable) {
-        const auto& gi = CudaHashCalculator::GetGPUInfo();
-        int sel = FileRenamerCLI::GetSelectedDevice();
-        if (sel >= 0 && sel < gi.deviceCount) {
-            gpuMemMB = gi.devices[sel].totalGlobalMem / (1024ull * 1024ull);
-        }
-    }
-#endif
 
     // Buffer size (favor higher throughput)
     if (!userSetBuffer) {

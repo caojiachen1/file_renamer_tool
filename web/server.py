@@ -143,19 +143,15 @@ def build_args(payload: dict) -> List[str]:
     if bool(payload.get("extreme")):
         args += ["--extreme"]
 
-    # Optional tunables
+    # Optional tunables (CPU-side I/O/mmap tuning)
     def add_opt(key: str, flag: str):
         v = payload.get(key)
         if v is None or v == "":
             return
         args.extend([flag, str(int(v))])
 
-    add_opt("gpu_min_kb", "--gpu-min-kb")
     add_opt("buffer_kb", "--buffer-kb")
     add_opt("mmap_chunk_mb", "--mmap-chunk-mb")
-    add_opt("gpu_file_cap_mb", "--gpu-file-cap-mb")
-    add_opt("gpu_batch_bytes_mb", "--gpu-batch-bytes-mb")
-    add_opt("gpu_chunk_mb", "--gpu-chunk-mb")
 
     return args
 

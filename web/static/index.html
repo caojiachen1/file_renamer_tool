@@ -65,8 +65,6 @@
             <select id="device" style="flex:1;">
               <option value="auto">auto</option>
               <option value="cpu" selected>cpu</option>
-              <option value="0">GPU 0</option>
-              <option value="1">GPU 1</option>
             </select>
             <button class="secondary" id="btnDevices" title="列出设备">刷新</button>
           </div>
@@ -112,30 +110,12 @@
         <summary>高级参数（可选）</summary>
   <div class="row3" style="margin-top:12px; gap:16px;">
           <div>
-            <label>GPU最小KB</label>
-            <input id="gpu_min_kb" type="number" min="1" placeholder="自动" />
-          </div>
-          <div>
             <label>缓冲KB</label>
             <input id="buffer_kb" type="number" min="1" placeholder="自动" />
           </div>
           <div>
             <label>mmap块MB</label>
             <input id="mmap_chunk_mb" type="number" min="1" placeholder="自动" />
-          </div>
-        </div>
-  <div class="row3" style="margin-top:12px; gap:16px;">
-          <div>
-            <label>GPU文件上限MB</label>
-            <input id="gpu_file_cap_mb" type="number" min="1" placeholder="自动" />
-          </div>
-          <div>
-            <label>GPU批总字节MB</label>
-            <input id="gpu_batch_bytes_mb" type="number" min="1" placeholder="自动" />
-          </div>
-          <div>
-            <label>GPU分块MB</label>
-            <input id="gpu_chunk_mb" type="number" min="1" placeholder="自动" />
           </div>
         </div>
       </details>
@@ -240,12 +220,8 @@
           yes: $("execute").checked, // auto-confirm when execute
           recursive: $("recursive").checked,
           extreme: $("extreme").checked,
-          gpu_min_kb: $("gpu_min_kb").value,
           buffer_kb: $("buffer_kb").value,
           mmap_chunk_mb: $("mmap_chunk_mb").value,
-          gpu_file_cap_mb: $("gpu_file_cap_mb").value,
-          gpu_batch_bytes_mb: $("gpu_batch_bytes_mb").value,
-          gpu_chunk_mb: $("gpu_chunk_mb").value,
         };
       }
 
