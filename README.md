@@ -5,44 +5,37 @@ A command-line utility for batch renaming files using hash algorithms (MD5, SHA1
 ## Features
 
 - **Hash-based renaming**: Rename files using multiple hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B)
-- **Unified Device Selection**: Single executable with intelligent CPU/GPU switching via `--device` parameter
-- **GPU Acceleration**: CUDA GPU support for faster hash calculation on large files
+- **CPU-focused design**: Modern, highly-optimized multi-threaded CPU pipeline
 - **Extension filtering**: Process only files with specific extensions
 - **Recursive scanning**: Option to scan subdirectories
 - **Preview mode**: See what changes will be made before executing
 - **Multi-threading**: Optimized CPU processing with configurable thread count
 - **Cross-platform**: Windows support with Visual Studio 2022
-- **Wide GPU Support**: Maxwell, Pascal, Volta, Turing, Ampere, Ada Lovelace, Blackwell architectures
+
+## CPU-only Focus and CUDA Deprecation
+
+The **main branch** of this project is now **CPU-only** and no longer ships a maintained CUDA implementation.
+
+- Earlier versions experimented with a CUDA-based GPU pipeline.
+- In real-world workloads, the CUDA path often performed **significantly worse than the optimized CPU path** and could degrade over time, even when the GPU appeared fully utilized.
+- To reduce complexity and improve reliability, the project has been refocused entirely on a fast, robust CPU pipeline.
+
+If you are looking for the historical CUDA implementation for research or experimentation, please check the `cuda-legacy` branch:
+
+- `main`: CPU-only, actively maintained, recommended for all users.
+- `cuda-legacy`: Archived experimental CUDA implementation, **no longer tuned or supported**.
 
 ## Device Selection
 
-The unified executable `file_renamer.exe` supports intelligent device selection:
-
-- **CPU Processing**: `-d cpu` or `-d -1` (always available)
-- **Auto Selection**: `-d auto` (default - chooses best available device)
-- **GPU Processing**: `-d 0`, `-d 1`, etc. (specific GPU devices)
-- **Device Discovery**: `-d list` (shows all available devices)
+The unified executable `file_renamer.exe` runs on CPU. Any previous GPU device selection flags are deprecated and may be removed in future versions.
 
 ## Requirements
 
 - Windows 10/11
 - Visual Studio 2022 with C++ development tools
 - CMake 3.20 or later
-- **Optional**: NVIDIA GPU with CUDA support (GTX 900 series or newer) for GPU acceleration
 
-## GPU Support
-
-This tool supports CUDA GPU acceleration for faster hash computation on large files:
-
-- **Supported GPUs**: NVIDIA GTX 900 series and newer (compute capability 5.0+)
-- **Performance**: 2-10x faster hash calculation for large files
-- **Auto-fallback**: Automatically uses CPU if GPU is unavailable
-- **Supported Architectures**: Maxwell, Pascal, Volta, Turing, Ampere, Ada Lovelace, Blackwell
-
-To check GPU compatibility:
-```cmd
-check_gpu_compatibility.bat
-```
+> Note: CUDA / NVIDIA GPU is **no longer required** or used on the main branch. For the historical CUDA pipeline, see the `cuda-legacy` branch.
 
 ## Quick Start
 
