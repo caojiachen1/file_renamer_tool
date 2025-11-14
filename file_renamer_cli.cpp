@@ -20,14 +20,7 @@
 
 #pragma comment(lib, "advapi32.lib")
 
-// CUDA support (optional compilation)
-#ifdef USE_CUDA
-    #include "cuda_hash.cuh"
-    #pragma comment(lib, "cudart.lib")
-    #define CUDA_AVAILABLE true
-#else
-    #define CUDA_AVAILABLE false
-#endif
+// CUDA/GPU support removed - CPU processing only
 
 namespace fs = std::filesystem;
 
@@ -129,18 +122,12 @@ private:
     // Optimized hex conversion using lookup table with SIMD-friendly approach
     static const char HEX_CHARS[16];
     
-    // GPU acceleration support
-    static bool gpuInitialized;
-    static bool useGPU;
-    static size_t gpuMinFileSize;
-    static int selectedDevice;
+    // CPU processing only
     
     // I/O performance tuning
     static size_t ioBufferKB;      // streaming buffer size in KB (for ReadFile)
     static size_t mmapChunkMB;     // chunk size for hashing memory-mapped views
-    static size_t gpuFileCapMB;    // max file size (MB) to load into memory for GPU hashing
-    static size_t gpuBatchBytesMB; // max total bytes per GPU mini-batch in batch mode
-    static size_t gpuChunkMB;      // chunk size (MB) for single-file CRC32 GPU chunking
+
     
     // CPU-optimized hex conversion for better performance
     static std::string BytesToHexOptimized(const BYTE* data, DWORD length) {
@@ -177,17 +164,14 @@ private:
 
 public:
     // Tuning setters
-    static void SetGPUMinFileSizeBytes(size_t bytes) { gpuMinFileSize = bytes; }
+    static void SetGPUMinFileSizeBytes(size_t bytes) { /* GPU support removed */ }
     static void SetIOBufferKB(size_t kb) { ioBufferKB = (kb == 0 ? 64 : kb); }
     static void SetMmapChunkMB(size_t mb) { mmapChunkMB = (mb == 0 ? 1 : mb); }
-    static void SetGPUFileCapMB(size_t mb) { gpuFileCapMB = (mb == 0 ? 64 : mb); }
-    static void SetGPUBatchBytesMB(size_t mb) { gpuBatchBytesMB = (mb == 0 ? 256 : mb); }
-    static void SetGPUChunkMB(size_t mb) { gpuChunkMB = (mb == 0 ? 8 : mb); }
+    static void SetGPUFileCapMB(size_t mb) { /* GPU support removed */ }
+    static void SetGPUBatchBytesMB(size_t mb) { /* GPU support removed */ }
+    static void SetGPUChunkMB(size_t mb) { /* GPU support removed */ }
 
-private:
-    static bool IsGPUSupportedAlgorithm(const std::string& algorithm) {
-        return (algorithm == "MD5" || algorithm == "SHA1" || algorithm == "SHA256" || algorithm == "CRC32");
-    }
+
 public:
     // CRC32 combine using GF(2) matrices, operates on post-XOR (finalized) CRC values
     static uint32_t CRC32_Combine(uint32_t crc1, uint32_t crc2, uint64_t len2) {
@@ -236,319 +220,20 @@ public:
 
 private:
     static std::string CalculateFileHashCRC32_ChunkedGPU(const fs::path& filePath) {
-#ifndef USE_CUDA
-        (void)filePath; return "";
-#else
-        // Open file
-        HANDLE hFile = CreateFileW(filePath.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-        if (hFile == INVALID_HANDLE_VALUE) return "";
-        LARGE_INTEGER liSize; if (!GetFileSizeEx(hFile, &liSize)) { CloseHandle(hFile); return ""; }
-        uint64_t totalSize = static_cast<uint64_t>(liSize.QuadPart);
-        if (totalSize == 0) { CloseHandle(hFile); return std::string("00000000"); }
-
-        const size_t chunkBytes = std::max<size_t>(gpuChunkMB * 1024ull * 1024ull, 1ull * 1024ull * 1024ull); // at least 1MB
-        const size_t batchCapBytes = std::max<size_t>(gpuBatchBytesMB * 1024ull * 1024ull, chunkBytes);
-
-        uint64_t offset = 0;
-        uint32_t crcTotal = 0x00000000u; // finalized representation for empty prefix
-        while (offset < totalSize) {
-            // prepare one GPU mini-batch
-            std::vector<std::vector<unsigned char>> chunks;
-            chunks.reserve(static_cast<size_t>(batchCapBytes / chunkBytes) + 1);
-            uint64_t bytesQueued = 0;
-            std::vector<uint32_t> chunkLens;
-
-            while (offset < totalSize && bytesQueued < batchCapBytes) {
-                size_t toRead = static_cast<size_t>(std::min<uint64_t>(chunkBytes, totalSize - offset));
-                std::vector<unsigned char> buf(toRead);
-                DWORD read = 0; BOOL ok = ReadFile(hFile, buf.data(), static_cast<DWORD>(toRead), &read, NULL);
-                if (!ok) { CloseHandle(hFile); return ""; }
-                if (read == 0) break;
-                buf.resize(read);
-                chunks.emplace_back(std::move(buf));
-                chunkLens.emplace_back(read);
-                bytesQueued += read;
-                offset += read;
-            }
-            if (chunks.empty()) break;
-
-            // GPU batch CRC32 on chunks
-            auto hashes = CudaHashCalculator::CalculateBatchCRC32_GPU(chunks);
-            if (hashes.size() != chunks.size()) { CloseHandle(hFile); return ""; }
-
-            // Combine with running CRC
-            for (size_t i = 0; i < hashes.size(); ++i) {
-                const std::string& hx = hashes[i];
-                if (hx.size() != 8) { CloseHandle(hFile); return ""; }
-                // parse hex to uint32
-                uint32_t c = 0;
-                for (char ch : hx) {
-                    c <<= 4;
-                    if (ch >= '0' && ch <= '9') c |= static_cast<uint32_t>(ch - '0');
-                    else if (ch >= 'a' && ch <= 'f') c |= static_cast<uint32_t>(ch - 'a' + 10);
-                    else if (ch >= 'A' && ch <= 'F') c |= static_cast<uint32_t>(ch - 'A' + 10);
-                }
-                crcTotal = CRC32_Combine(crcTotal, c, chunkLens[i]);
-            }
-        }
-        CloseHandle(hFile);
-        std::stringstream ss; ss << std::hex << std::setfill('0') << std::setw(8) << crcTotal;
-        return ss.str();
-#endif
+        // GPU support removed - use standard CPU CRC32 processing
+        return CalculateFileHashOptimized(filePath, "CRC32");
     }
 public:
 
-    // GPU acceleration functions
-    static bool InitializeGPU(int deviceId = -2) { // -2 means auto, -1 means CPU, >=0 means specific GPU
-        if (gpuInitialized) return useGPU;
-        
-        gpuInitialized = true;
-        
-        // If specifically requesting CPU
-        if (deviceId == -1) {
-            ForceCPUMode();
-            return false; // Return false for GPU, but this is expected for CPU
-        }
-        
-#ifdef USE_CUDA
-        // Lightweight CUDA availability check first
-        int deviceCount = 0;
-        cudaError_t cudaError = cudaGetDeviceCount(&deviceCount);
-        
-        if (cudaError != cudaSuccess || deviceCount == 0) {
-            if (deviceId >= 0) {
-                std::cout << "CUDA not available (" << cudaGetErrorString(cudaError) 
-                          << "), cannot use GPU device " << deviceId << std::endl;
-            }
-            std::cout << "Using CPU processing (CUDA not available)" << std::endl;
-            useGPU = false;
-            selectedDevice = -1;
-            return false;
-        }
-        
-        if (CudaHashCalculator::Initialize()) {
-            // If deviceId is specified and >= 0, try to select that device
-            if (deviceId >= 0) {
-                const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
-                if (deviceId < gpuInfo.deviceCount) {
-                    cudaError_t error = cudaSetDevice(deviceId);
-                    if (error == cudaSuccess) {
-                        selectedDevice = deviceId;
-                        useGPU = true;
-                        gpuMinFileSize = 4096; // 4KB minimum for GPU processing
-                        std::cout << "GPU acceleration enabled on device " << deviceId 
-                                  << " (" << gpuInfo.devices[deviceId].name << ")" << std::endl;
-                        return true;
-                    } else {
-                        std::cout << "Failed to select device " << deviceId 
-                                  << ": " << cudaGetErrorString(error) << std::endl;
-                        std::cout << "Falling back to CPU processing..." << std::endl;
-                    }
-                } else {
-                    std::cout << "Invalid device ID " << deviceId 
-                              << ". Available GPU devices: 0-" << (gpuInfo.deviceCount - 1) << std::endl;
-                    std::cout << "Falling back to CPU processing..." << std::endl;
-                }
-            }
-            
-            // Auto-selection (deviceId == -2) or fallback
-            else if (deviceId == -2) {
-                if (CudaHashCalculator::SelectBestDevice()) {
-                    selectedDevice = CudaHashCalculator::GetGPUInfo().selectedDevice;
-                    useGPU = true;
-                    gpuMinFileSize = 4096; // 4KB minimum for GPU processing
-                    std::cout << "GPU acceleration auto-enabled on device " << selectedDevice
-                              << " (" << CudaHashCalculator::GetGPUInfo().devices[selectedDevice].name << ")" << std::endl;
-                    return true;
-                } else {
-                    std::cout << "No suitable GPU found, using CPU processing" << std::endl;
-                }
-            }
-        } else {
-            if (deviceId >= 0) {
-                std::cout << "CUDA initialization failed, cannot use GPU device " << deviceId << std::endl;
-            }
-            std::cout << "GPU acceleration not available, using CPU processing" << std::endl;
-        }
-#else
-        if (deviceId >= 0) {
-            std::cout << "CUDA support not compiled, cannot use GPU device " << deviceId << std::endl;
-        }
-        std::cout << "Using CPU processing (CUDA not available)" << std::endl;
-#endif
-        
-        // Fallback to CPU
-        useGPU = false;
-        selectedDevice = -1;
-        return false;
-    }
+    // CPU processing only
     
-    // Force CPU-only mode and cleanup any GPU resources
-    static void ForceCPUMode() {
-        if (gpuInitialized) {
-            CleanupGPU();
-        }
-        useGPU = false;
-        selectedDevice = -1;
-        gpuInitialized = true; // Mark as initialized but in CPU mode
-        std::cout << "Forced CPU-only mode enabled" << std::endl;
-    }
+
     
-    // Get current selected device
-    static int GetSelectedDevice() {
-        return selectedDevice;
-    }
+    // Device listing removed - CPU processing only
     
-    // List available devices (CPU and GPU)
-    static void ListAvailableDevices() {
-        std::cout << "Available computing devices:" << std::endl;
-        
-        // Show detailed CPU information as device -1
-        // Get CPU name from registry
-        std::string cpuName = "Unknown CPU";
-        HKEY hKey;
-        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            char processorName[256];
-            DWORD bufferSize = sizeof(processorName);
-            if (RegQueryValueExA(hKey, "ProcessorNameString", NULL, NULL, (LPBYTE)processorName, &bufferSize) == ERROR_SUCCESS) {
-                cpuName = std::string(processorName);
-                // Trim whitespace
-                cpuName.erase(0, cpuName.find_first_not_of(" \t\r\n"));
-                cpuName.erase(cpuName.find_last_not_of(" \t\r\n") + 1);
-            }
-            RegCloseKey(hKey);
-        }
-        
-        std::cout << "  Device -1: " << cpuName << std::endl;
-        std::cout << "    Type: CPU (Multi-threaded)" << std::endl;
-        std::cout << "    Logical Cores: " << std::thread::hardware_concurrency() << std::endl;
-        
-        // Get additional CPU information from Windows
-        SYSTEM_INFO sysInfo;
-        GetSystemInfo(&sysInfo);
-        std::cout << "    Physical Processors: " << sysInfo.dwNumberOfProcessors << std::endl;
-        std::cout << "    Processor Architecture: ";
-        switch (sysInfo.wProcessorArchitecture) {
-            case PROCESSOR_ARCHITECTURE_AMD64:
-                std::cout << "x64 (AMD64)";
-                break;
-            case PROCESSOR_ARCHITECTURE_ARM:
-                std::cout << "ARM";
-                break;
-            case PROCESSOR_ARCHITECTURE_ARM64:
-                std::cout << "ARM64";
-                break;
-            case PROCESSOR_ARCHITECTURE_INTEL:
-                std::cout << "x86 (Intel)";
-                break;
-            default:
-                std::cout << "Unknown (" << sysInfo.wProcessorArchitecture << ")";
-                break;
-        }
-        std::cout << std::endl;
-        
-        // Get memory information
-        MEMORYSTATUSEX memInfo;
-        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
-        if (GlobalMemoryStatusEx(&memInfo)) {
-            std::cout << "    Total RAM: " << (memInfo.ullTotalPhys / (1024*1024)) << " MB" << std::endl;
-            std::cout << "    Available RAM: " << (memInfo.ullAvailPhys / (1024*1024)) << " MB" << std::endl;
-            std::cout << "    Memory Usage: " << (100 - (memInfo.ullAvailPhys * 100 / memInfo.ullTotalPhys)) << "%" << std::endl;
-        }
-        
-        if (selectedDevice == -1) {
-            std::cout << "    Status: Currently selected" << std::endl;
-        } else {
-            std::cout << "    Status: Always available" << std::endl;
-        }
-        std::cout << std::endl;
-        
-#ifdef USE_CUDA
-        // Don't force initialize CUDA just to list devices
-        // Only check if CUDA is available but don't initialize full context
-        int deviceCount = 0;
-        cudaError_t error = cudaGetDeviceCount(&deviceCount);
-        bool cudaAvailable = (error == cudaSuccess && deviceCount > 0);
-        
-        if (cudaAvailable) {
-            if (gpuInitialized) {
-                // If GPU is already initialized, show full info
-                const auto& gpuInfo = CudaHashCalculator::GetGPUInfo();
-                
-                if (gpuInfo.deviceCount == 0) {
-                    std::cout << "No CUDA-capable GPU devices found." << std::endl;
-                } else {
-                    for (int i = 0; i < gpuInfo.deviceCount; i++) {
-                        const auto& device = gpuInfo.devices[i];
-                        std::cout << "  Device " << i << ": " << device.name << std::endl;
-                        std::cout << "    Type: GPU (CUDA)" << std::endl;
-                        std::cout << "    Compute Capability: " << device.major << "." << device.minor << std::endl;
-                        std::cout << "    Global Memory: " << (device.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
-                        std::cout << "    Multiprocessors: " << device.multiProcessorCount << std::endl;
-                        std::cout << "    Max Threads per Block: " << device.maxThreadsPerBlock << std::endl;
-                        if (selectedDevice == i && useGPU) {
-                            std::cout << "    Status: Currently selected" << std::endl;
-                        }
-                        std::cout << std::endl;
-                    }
-                }
-            } else {
-                // Show basic GPU info without full initialization
-                std::cout << "CUDA-capable GPU devices detected: " << deviceCount << " device(s)" << std::endl;
-                
-                // Get basic device properties without initializing CUDA context
-                for (int i = 0; i < deviceCount; i++) {
-                    cudaDeviceProp prop;
-                    cudaError_t error = cudaGetDeviceProperties(&prop, i);
-                    
-                    if (error == cudaSuccess) {
-                        std::cout << "  Device " << i << ": " << prop.name << std::endl;
-                        std::cout << "    Type: GPU (CUDA)" << std::endl;
-                        std::cout << "    Compute Capability: " << prop.major << "." << prop.minor << std::endl;
-                        std::cout << "    Global Memory: " << (prop.totalGlobalMem / (1024*1024)) << " MB" << std::endl;
-                        std::cout << "    Multiprocessors: " << prop.multiProcessorCount << std::endl;
-                        std::cout << "    Max Threads per Block: " << prop.maxThreadsPerBlock << std::endl;
-                        std::cout << "    Status: Available (not initialized)" << std::endl;
-                        std::cout << std::endl;
-                    } else {
-                        std::cout << "  Device " << i << ": <Error getting properties>" << std::endl;
-                        std::cout << "    Error: " << cudaGetErrorString(error) << std::endl;
-                        std::cout << std::endl;
-                    }
-                }
-                
-                std::cout << "Use -d <id> or -d auto to enable GPU acceleration." << std::endl;
-            }
-        } else {
-            std::cout << "No CUDA-capable GPU devices available." << std::endl;
-        }
-#else
-        std::cout << "CUDA support not compiled. Only CPU processing available." << std::endl;
-#endif
-        
-        if (selectedDevice == -1) {
-            std::cout << "Currently selected: Device -1 (CPU)" << std::endl;
-        }
-    }
+    // Cleanup function removed - CPU processing only
     
-    // Cleanup GPU resources
-    static void CleanupGPU() {
-#ifdef USE_CUDA
-        if (useGPU || gpuInitialized) {
-            CudaHashCalculator::Cleanup();
-            // Force reset CUDA context to free memory
-            cudaDeviceReset();
-        }
-#endif
-        useGPU = false;
-        selectedDevice = -1;
-        gpuInitialized = false;
-    }
-    
-    // Determine if file should be processed on GPU
-    static bool ShouldUseGPU(size_t fileSize) {
-        return useGPU && fileSize >= gpuMinFileSize;
-    }
+    // GPU processing check removed - CPU only
     
     static std::string CalculateMD5(const std::vector<BYTE>& data) {
         HCRYPTPROV hProv = 0;
@@ -1105,28 +790,6 @@ public:
             return "";
         }
         
-        // Special fast path: CRC32 single-file GPU chunked processing for large files
-        if (algorithm == "CRC32" && useGPU) {
-            if (fileSize >= gpuMinFileSize) {
-                // Prefer chunked GPU path when file is larger than in-memory cap
-                if (static_cast<uint64_t>(fileSize) > gpuFileCapMB * 1024ull * 1024ull) {
-                    auto res = CalculateFileHashCRC32_ChunkedGPU(filePath);
-                    if (!res.empty()) return res;
-                    // on failure, fall back
-                }
-            }
-        }
-
-        // Fast path: if GPU available and file size within cap, load entire file and hash on GPU for supported algos
-        if (useGPU && (algorithm == "MD5" || algorithm == "SHA1" || algorithm == "SHA256" || algorithm == "CRC32")) {
-            if (fileSize >= gpuMinFileSize && fileSize <= gpuFileCapMB * 1024ull * 1024ull) {
-                auto data = ReadFileEntireWin(filePath);
-                if (!data.empty()) {
-                    return CalculateHash(data, algorithm); // will route to GPU if above min size
-                }
-                // fallback if read failed -> continue
-            }
-        }
         
         // Use memory mapping for very large files (>100MB)
         if (fileSize > 100 * 1024 * 1024) {
@@ -1418,14 +1081,7 @@ public:
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Threads: " << numThreads << std::endl;
         
-        // Display device status
-        if (!gpuInitialized) {
-            InitializeGPU(-2); // Use auto-selection
-        }
-        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
-        if (useGPU) {
-            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
-        }
+        std::cout << "Processing device: CPU" << std::endl;
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -1665,13 +1321,8 @@ public:
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         
         // Display device status
-        if (!gpuInitialized) {
-            InitializeGPU(-2); // Use auto-selection
-        }
-        std::cout << "Processing device: " << (useGPU ? ("GPU " + std::to_string(selectedDevice)) : "CPU") << std::endl;
-        if (useGPU) {
-            std::cout << "GPU min file size: " << (gpuMinFileSize / 1024) << " KB" << std::endl;
-        }
+        
+        std::cout << "Processing device: CPU" << std::endl;
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -1811,17 +1462,14 @@ public:
             numThreads = hc;
         }
         
-    std::cout << "Ultra-fast processing mode enabled!" << std::endl;
+        std::cout << "Ultra-fast processing mode enabled!" << std::endl;
         std::cout << "Scanning directory: " << directoryPath << std::endl;
         std::cout << "Algorithm: " << algorithm << std::endl;
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Optimized threads: " << numThreads << std::endl;
-    std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
-        if (useGPU) {
-            std::cout << "GPU min: " << (gpuMinFileSize/1024) << " KB, file-cap: " << gpuFileCapMB << " MB, batch-cap: " << gpuBatchBytesMB << " MB" << std::endl;
-        }
+        std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -2099,15 +1747,10 @@ public:
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
         std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
-    std::cout << "Threads: " << numThreads << std::endl;
-    std::cout << "Batch size: " << batchSize << std::endl;
-    std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
-        
-        // Display device status (CPU-only in main branch)
-        if (!gpuInitialized) {
-            InitializeGPU(-1); // Force CPU-only mode
-        }
-        std::cout << "Processing device: CPU (CUDA/GPU support removed in main branch)" << std::endl;
+        std::cout << "Threads: " << numThreads << std::endl;
+        std::cout << "Batch size: " << batchSize << std::endl;
+        std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
+        std::cout << "Processing device: CPU" << std::endl;
         
         if (!allowedExtensions.empty()) {
             std::cout << "Extensions filter: ";
@@ -2178,10 +1821,6 @@ public:
                 
                 const auto& batch = batches[batchIndex];
                 
-                // CPU-only: GPU batch path removed; flushGpu is a no-op placeholder.
-                auto flushGpu = [&]() {
-                };
-                
                 // Process all files in this batch
                 for (size_t fileIndex = 0; fileIndex < batch.size(); fileIndex++) {
                     const auto& file = batch[fileIndex];
@@ -2216,7 +1855,6 @@ public:
                             continue;
                         }
                         
-                        // CPU-only: always process immediately on CPU in main branch
                         {
                             std::string hash = CalculateFileHashOptimized(file, algorithm);
                             std::stringstream out;
@@ -2263,8 +1901,6 @@ public:
                         skippedCount++;
                     }
                 }
-                // Flush remaining GPU candidates for this batch
-                flushGpu();
             }
         };
         
@@ -2317,16 +1953,9 @@ public:
 // Static member definition
 const char FileRenamerCLI::HEX_CHARS[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
 
-// GPU-related static member definitions (kept for CLI flags compatibility, but CPU-only in main branch)
-bool FileRenamerCLI::gpuInitialized = false;
-bool FileRenamerCLI::useGPU = false;
-size_t FileRenamerCLI::gpuMinFileSize = 4096;
-int FileRenamerCLI::selectedDevice = -1;
-size_t FileRenamerCLI::ioBufferKB = 1024;   // 1MB default streaming buffer
-size_t FileRenamerCLI::mmapChunkMB = 4;     // 4MB default mmap feed chunk
-size_t FileRenamerCLI::gpuFileCapMB = 64;   // 64MB default cap for GPU in-memory hashing (unused)
-size_t FileRenamerCLI::gpuBatchBytesMB = 256; // 256MB default GPU mini-batch cap (unused)
-size_t FileRenamerCLI::gpuChunkMB = 8;      // 8MB default single-file CRC32 GPU chunk size (unused)
+// Static member definitions - CPU only (GPU support removed)
+size_t FileRenamerCLI::ioBufferKB = 1024;     // 1MB default streaming buffer
+size_t FileRenamerCLI::mmapChunkMB = 4;       // 4MB default mmap feed chunk
 
 void PrintUsage() {
     std::cout << "File Batch Renamer Tool" << std::endl;
@@ -2344,14 +1973,8 @@ void PrintUsage() {
     std::cout << "  -y, --yes               Auto-confirm without user interaction" << std::endl;
     std::cout << "  -t, --threads <n>       Number of processing threads [default: auto-detect]" << std::endl;
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
-    std::cout << "  -d, --device <id|cpu|auto> Device to use: -1 or 'cpu' for CPU, 0,1,2... for GPU, 'auto' for best available" << std::endl;
-    std::cout << "                          Use 'list' to show available devices [default: auto]" << std::endl;
-    std::cout << "  --gpu-min-kb <n>        Minimum file size (KB) to use GPU [default: auto(4)]" << std::endl;
     std::cout << "  --buffer-kb <n>         Streaming buffer size (KB) for hashing [default: auto]" << std::endl;
     std::cout << "  --mmap-chunk-mb <n>     Chunk size (MB) to feed from memory-mapped views [default: auto]" << std::endl;
-    std::cout << "  --gpu-file-cap-mb <n>   Max file size (MB) to load entirely for GPU hashing [default: auto]" << std::endl;
-    std::cout << "  --gpu-batch-bytes-mb <n> Max total bytes (MB) per GPU mini-batch in batch mode [default: auto]" << std::endl;
-    std::cout << "  --gpu-chunk-mb <n>      Single-file CRC32 GPU chunk size (MB) [default: auto]" << std::endl;
     std::cout << "  --single-thread         Use single-threaded processing (original mode)" << std::endl;
     std::cout << "  --multi-thread          Use multi-threaded processing [default]" << std::endl;
     std::cout << "  --batch-mode            Use batch processing mode (best for large datasets)" << std::endl;
@@ -2367,29 +1990,13 @@ void PrintUsage() {
     std::cout << "  --ultra-fast            Use ultra-fast processing mode with thread pool" << std::endl;
     std::cout << "  --extreme               Extreme performance tuning (very high threads/buffers/batches; higher memory usage)" << std::endl;
     std::cout << std::endl;
-#ifdef USE_CUDA
     std::cout << "Device Support:" << std::endl;
-    std::cout << "  This version includes CUDA GPU acceleration support" << std::endl;
-    std::cout << "  CPU (Device -1): Always available, multi-threaded processing" << std::endl;
-    std::cout << "  GPU (Device 0+): CUDA-capable devices for large files (>4KB)" << std::endl;
-    std::cout << "  Supported GPU algorithms: MD5, SHA1, SHA256, CRC32" << std::endl;
-    std::cout << "  Auto-selection chooses best available device by default" << std::endl;
+    std::cout << "  CPU processing only" << std::endl;
+    std::cout << "  Multi-threaded processing with thread pool" << std::endl;
     std::cout << std::endl;
-#else
-    std::cout << "Device Support:" << std::endl;
-    std::cout << "  CPU processing only (CUDA support not compiled)" << std::endl;
-    std::cout << "  All devices selections will use CPU processing" << std::endl;
-    std::cout << std::endl;
-#endif
     std::cout << "Examples:" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles                              # Auto-select best available device" << std::endl;
+    std::cout << "  file_renamer C:\\MyFiles                              # Process files in C:\\MyFiles" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -x jpg,png -t 8              # Use 8 threads for jpg/png files" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d list                      # List all available devices" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d auto                      # Auto-select best device" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d cpu                       # Force CPU processing" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d -1                        # Force CPU processing (alternative)" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d 0                         # Use GPU device 0" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles -d 1 -a SHA256               # Use GPU device 1 with SHA256" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles --batch-mode -b 50            # Batch mode with 50 files per batch" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles --single-thread               # Original single-threaded mode" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -e -t 16           # Execute SHA1 renaming with 16 threads, recursive" << std::endl;
@@ -2429,7 +2036,6 @@ int main(int argc, char* argv[]) {
     
     std::string directory;
     std::string algorithm = "MD5";
-    std::string deviceSelection = "auto"; // auto, cpu, list, or device ID
     bool recursive = false;
     bool dryRun = true;
     bool showHelp = false;
@@ -2437,13 +2043,9 @@ int main(int argc, char* argv[]) {
     bool autoConfirm = false; // Auto-confirm without user interaction
     int numThreads = 0; // Auto-detect by default
     size_t batchSize = 0; // Auto-calculate by default
-    size_t argGpuMinKB = 4; // default auto -> 4KB threshold
     size_t argBufferKB = 0; // 0 means auto-tune
     size_t argMmapChunkMB = 0; // 0 means auto-tune
-    size_t argGPUFileCapMB = 0; // 0 means auto-tune
-    size_t argGPUBatchBytesMB = 0; // 0 means auto-tune
-    size_t argGPUChunkMB = 0; // 0 means auto-tune for single-file CRC32 chunking
-    bool userSetGpuMin = false, userSetBuffer = false, userSetMmap = false, userSetGpuFileCap = false, userSetGpuBatch = false, userSetGpuChunk = false;
+    bool userSetBuffer = false, userSetMmap = false;
     enum ProcessingMode { ULTRA_FAST, MULTI_THREAD, BATCH_MODE, SINGLE_THREAD };
     ProcessingMode mode = ULTRA_FAST; // Default to ultra-fast mode
     std::vector<std::string> allowedExtensions;
@@ -2496,23 +2098,6 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: Invalid batch size: " << batchSize << std::endl;
                 return 1;
             }
-        } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
-            deviceSelection = argv[++i];
-            // Validate device selection
-            if (deviceSelection == "list") {
-                // List devices and exit
-                FileRenamerCLI::ListAvailableDevices();
-                return 0;
-            } else if (deviceSelection != "auto" && deviceSelection != "cpu") {
-                // Check if it's a valid device ID (including -1 for CPU)
-                char* endPtr;
-                long deviceId = std::strtol(deviceSelection.c_str(), &endPtr, 10);
-                if (*endPtr != '\0' || deviceId < -1) {
-                    std::cerr << "Error: Invalid device specification: " << deviceSelection << std::endl;
-                    std::cerr << "Use 'auto', 'cpu', 'list', -1 (CPU), or a GPU device ID (0, 1, 2, ...)" << std::endl;
-                    return 1;
-                }
-            }
         } else if ((arg == "-x" || arg == "--extensions") && i + 1 < argc) {
             std::string extensionsStr = argv[++i];
             allowedExtensions = ParseExtensions(extensionsStr);
@@ -2520,11 +2105,6 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: No valid extensions specified" << std::endl;
                 return 1;
             }
-        } else if (arg == "--gpu-min-kb" && i + 1 < argc) {
-            long v = std::strtol(argv[++i], nullptr, 10);
-            if (v <= 0) { std::cerr << "Error: Invalid --gpu-min-kb value" << std::endl; return 1; }
-            argGpuMinKB = static_cast<size_t>(v);
-            userSetGpuMin = true;
         } else if (arg == "--buffer-kb" && i + 1 < argc) {
             long v = std::strtol(argv[++i], nullptr, 10);
             if (v <= 0) { std::cerr << "Error: Invalid --buffer-kb value" << std::endl; return 1; }
@@ -2535,21 +2115,6 @@ int main(int argc, char* argv[]) {
             if (v <= 0) { std::cerr << "Error: Invalid --mmap-chunk-mb value" << std::endl; return 1; }
             argMmapChunkMB = static_cast<size_t>(v);
             userSetMmap = true;
-        } else if (arg == "--gpu-file-cap-mb" && i + 1 < argc) {
-            long v = std::strtol(argv[++i], nullptr, 10);
-            if (v <= 0) { std::cerr << "Error: Invalid --gpu-file-cap-mb value" << std::endl; return 1; }
-            argGPUFileCapMB = static_cast<size_t>(v);
-            userSetGpuFileCap = true;
-        } else if (arg == "--gpu-batch-bytes-mb" && i + 1 < argc) {
-            long v = std::strtol(argv[++i], nullptr, 10);
-            if (v <= 0) { std::cerr << "Error: Invalid --gpu-batch-bytes-mb value" << std::endl; return 1; }
-            argGPUBatchBytesMB = static_cast<size_t>(v);
-            userSetGpuBatch = true;
-        } else if (arg == "--gpu-chunk-mb" && i + 1 < argc) {
-            long v = std::strtol(argv[++i], nullptr, 10);
-            if (v <= 0) { std::cerr << "Error: Invalid --gpu-chunk-mb value" << std::endl; return 1; }
-            argGPUChunkMB = static_cast<size_t>(v);
-            userSetGpuChunk = true;
         } else if (directory.empty() && arg[0] != '-') {
             directory = arg;
         } else {
@@ -2570,24 +2135,15 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Initialize processing device (CPU-only in main branch)
-    std::cout << "Initializing File Renamer Tool (CPU-only, CUDA removed)..." << std::endl;
-    // Ignore deviceSelection for now, but keep parsing for backward compatibility
-    if (!deviceSelection.empty() && deviceSelection != "cpu" && deviceSelection != "-1" && deviceSelection != "auto") {
-        std::cout << "Note: GPU/CUDA device selection is no longer supported; running on CPU instead." << std::endl;
-    }
-    bool gpuAvailable = false; // Always false in CPU-only build
+    // Initialize processing (CPU-only)
+    std::cout << "Initializing File Renamer Tool (CPU-only)" << std::endl;
 
-    // 2) Auto-tune defaults if not specified by user
-    //    - Tune by system RAM and GPU VRAM
+    // Auto-tune defaults based on system RAM
     MEMORYSTATUSEX memInfo; memInfo.dwLength = sizeof(MEMORYSTATUSEX);
     ULONGLONG totalRamMB = 0;
     if (GlobalMemoryStatusEx(&memInfo)) {
         totalRamMB = memInfo.ullTotalPhys / (1024ull * 1024ull);
     }
-
-    // Derive GPU VRAM in MB when available (CPU-only: always 0)
-    ULONGLONG gpuMemMB = 0;
 
     // Buffer size (favor higher throughput)
     if (!userSetBuffer) {
@@ -2603,42 +2159,6 @@ int main(int argc, char* argv[]) {
         else argMmapChunkMB = 8;
     }
 
-    // GPU file cap (allow larger in-memory GPU hashing)
-    if (!userSetGpuFileCap) {
-        if (gpuAvailable && gpuMemMB > 0) {
-            // Extreme: ~1/8 VRAM (256–2048 MB), otherwise ~1/16 (128–1024 MB)
-            if (extreme) {
-                ULONGLONG cap = std::max<ULONGLONG>(256, std::min<ULONGLONG>(2048, gpuMemMB / 8));
-                argGPUFileCapMB = static_cast<size_t>(cap);
-            } else {
-                ULONGLONG cap = std::max<ULONGLONG>(128, std::min<ULONGLONG>(1024, gpuMemMB / 16));
-                argGPUFileCapMB = static_cast<size_t>(cap);
-            }
-        } else {
-            argGPUFileCapMB = extreme ? 256 : 128; // CPU-only default
-        }
-    }
-
-    // GPU batch cap (favor larger batches)
-    if (!userSetGpuBatch) {
-        if (gpuAvailable && gpuMemMB > 0) {
-            // Extreme: ~1/2 VRAM [1024, 12288] MB, otherwise ~1/4 [512, 8192] MB
-            if (extreme) {
-                ULONGLONG cap = std::max<ULONGLONG>(1024, std::min<ULONGLONG>(12288, gpuMemMB / 2));
-                argGPUBatchBytesMB = static_cast<size_t>(cap);
-            } else {
-                ULONGLONG cap = std::max<ULONGLONG>(512, std::min<ULONGLONG>(8192, gpuMemMB / 4));
-                argGPUBatchBytesMB = static_cast<size_t>(cap);
-            }
-        } else {
-            argGPUBatchBytesMB = extreme ? 1024 : 512;
-        }
-    }
-
-    // GPU chunk size (favor larger chunk)
-    if (!userSetGpuChunk) {
-        argGPUChunkMB = extreme ? 32 : 16;
-    }
 
     // Threads/Batches auto when not set by user
     if (numThreads <= 0) {
@@ -2662,16 +2182,6 @@ int main(int argc, char* argv[]) {
     // 3) Apply tuned params
     FileRenamerCLI::SetIOBufferKB(argBufferKB);
     FileRenamerCLI::SetMmapChunkMB(argMmapChunkMB);
-    FileRenamerCLI::SetGPUFileCapMB(argGPUFileCapMB);
-    FileRenamerCLI::SetGPUBatchBytesMB(argGPUBatchBytesMB);
-    FileRenamerCLI::SetGPUChunkMB(argGPUChunkMB);
-
-    // Apply GPU min threshold after initialization (allow user override)
-    if (!userSetGpuMin) {
-        // Default 4KB; could bump slightly if VRAM tiny, but keep consistent
-        argGpuMinKB = 4;
-    }
-    FileRenamerCLI::SetGPUMinFileSizeBytes(argGpuMinKB * 1024ull);
 
     // Print final chosen parameters (concise)
     if (extreme) {
@@ -2680,9 +2190,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Auto-tuned parameters:" << std::endl;
     std::cout << "  Threads: " << numThreads << ", Batch size: " << batchSize << std::endl;
     std::cout << "  I/O buffer: " << argBufferKB << " KB, mmap chunk: " << argMmapChunkMB << " MB" << std::endl;
-    if (gpuAvailable) {
-        std::cout << "  GPU file-cap: " << argGPUFileCapMB << " MB, batch-cap: " << argGPUBatchBytesMB << " MB, chunk: " << argGPUChunkMB << " MB" << std::endl;
-    }
     
     if (!dryRun) {
         std::cout << "WARNING: This will permanently rename files!" << std::endl;
@@ -2722,8 +2229,6 @@ int main(int argc, char* argv[]) {
             break;
     }
     
-    // Cleanup GPU resources
-    FileRenamerCLI::CleanupGPU();
     
     return 0;
 }

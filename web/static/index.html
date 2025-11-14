@@ -49,7 +49,7 @@
           </select>
         </div>
       </div>
-  <div class="row3" style="margin-top:12px; gap:16px;">
+  <div class="row" style="margin-top:12px; gap:16px;">
         <div>
           <label>模式</label>
           <select id="mode">
@@ -58,17 +58,6 @@
             <option value="batch-mode">Batch Mode</option>
             <option value="single-thread">Single Thread</option>
           </select>
-        </div>
-        <div>
-          <label>设备</label>
-          <div style="display:flex; gap:6px;">
-            <select id="device" style="flex:1;">
-              <option value="auto">auto</option>
-              <option value="cpu" selected>cpu</option>
-            </select>
-            <button class="secondary" id="btnDevices" title="列出设备">刷新</button>
-          </div>
-          <small id="devicesOut" class="hint"></small>
         </div>
         <div>
           <label>扩展名过滤（逗号分隔）</label>
@@ -140,8 +129,7 @@
       const btnRun = $("run");
       const btnStop = $("stop");
       const btnClear = $("clear");
-      const btnDevices = $("btnDevices");
-      const devicesOut = $("devicesOut");
+
       const modeSelect = $("mode");
       const threadsInput = $("threads");
       let unlistenOutput = null;
@@ -158,28 +146,7 @@
         }
       }
 
-      async function refreshDevices() {
-        devicesOut.textContent = "查询中…";
-        try {
-          let j;
-          if (isTauri) {
-            j = await window.__TAURI__.invoke('list_devices');
-          } else {
-            const r = await fetch('/api/devices');
-            j = await r.json();
-          }
-          if (!j.ok) throw new Error(j.error || '未知错误');
-          devicesOut.textContent = '可用设备ID: ' + (j.deviceIds?.join(', ') || '无');
-        } catch (e) {
-          const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
-          devicesOut.textContent = '获取设备失败：' + msg;
-        }
-      }
-
-      btnDevices.addEventListener('click', (e) => {
-        e.preventDefault();
-        refreshDevices();
-      });
+      // Device listing removed - CPU processing only
 
       const btnBrowse = $("btnBrowse");
       btnBrowse.addEventListener('click', async (e) => {
@@ -211,7 +178,7 @@
           directory: $("directory").value,
           algorithm: $("algorithm").value,
           mode: $("mode").value,
-          device: $("device").value,
+          // Device selection removed - CPU processing only
           extensions: $("extensions").value,
           threads: $("threads").value,
           batch: $("batch").value,

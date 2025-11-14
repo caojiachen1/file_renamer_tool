@@ -124,20 +124,7 @@ def build_args(payload: dict) -> List[str]:
             if norm:
                 args += ["-x", norm]
 
-    # Device selection
-    device = (payload.get("device") or "cpu").strip()
-    if device:
-        # normalize values
-        dval = device.lower()
-        if dval in {"auto", "cpu", "list"}:
-            args += ["-d", dval]
-        else:
-            # numeric or -1
-            try:
-                int(device)
-            except Exception:
-                raise ValueError("设备选择无效: %s" % device)
-            args += ["-d", device]
+    # Device selection removed - CPU processing only (ignore device parameter)
 
     # Extreme tuning
     if bool(payload.get("extreme")):

@@ -8,10 +8,6 @@ if exist "file_renamer_cli.exe" (
     del "file_renamer_cli.exe"
 )
 
-if exist "file_renamer_cli_cuda.exe" (
-    echo Removing old CUDA executable: file_renamer_cli_cuda.exe
-    del "file_renamer_cli_cuda.exe"
-)
 
 REM 删除测试用的可执行文件
 if exist "file_renamer_cli_test.exe" (
