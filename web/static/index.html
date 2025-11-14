@@ -53,8 +53,7 @@
         <div>
           <label>模式</label>
           <select id="mode">
-            <option value="ultra-fast">Ultra Fast</option>
-            <option value="multi-thread">Multi Thread</option>
+            <option value="multi-thread">Multi Thread (默认)</option>
             <option value="batch-mode">Batch Mode</option>
             <option value="single-thread">Single Thread</option>
           </select>
@@ -88,10 +87,6 @@
         <div>
           <label>递归</label><br />
           <input id="recursive" type="checkbox" /> 包含子目录
-        </div>
-        <div>
-          <label>极限调优</label><br />
-          <input id="extreme" type="checkbox" /> Extreme 模式
         </div>
       </div>
 
@@ -135,18 +130,6 @@
       let unlistenOutput = null;
       let unlistenExit = null;
 
-      // Default: Ultra Fast uses all logical cores for maximum performance
-      const cpuThreads = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) ? navigator.hardwareConcurrency : 0;
-      function applyDefaultThreads() {
-        if (modeSelect.value === 'ultra-fast') {
-          if (!threadsInput.value) {
-            if (cpuThreads > 0) threadsInput.value = String(cpuThreads);
-            threadsInput.placeholder = '默认=全部线程';
-          }
-        }
-      }
-
-      // Device listing removed - CPU processing only
 
       const btnBrowse = $("btnBrowse");
       btnBrowse.addEventListener('click', async (e) => {
@@ -186,7 +169,6 @@
           execute: $("execute").checked,
           yes: $("execute").checked, // auto-confirm when execute
           recursive: $("recursive").checked,
-          extreme: $("extreme").checked,
           buffer_kb: $("buffer_kb").value,
           mmap_chunk_mb: $("mmap_chunk_mb").value,
         };
@@ -256,19 +238,12 @@
           }
         } catch {}
       });
-
-  // 不在启动时自动查询设备，避免某些环境下初次调用阻塞 UI。
-  // 用户可手动点击“刷新”按钮触发。
-
+      
       // Cleanup listeners when closing
       window.addEventListener('beforeunload', () => {
         try { if (unlistenOutput) { unlistenOutput(); unlistenOutput = null; } } catch {}
         try { if (unlistenExit) { unlistenExit(); unlistenExit = null; } } catch {}
       });
-
-      // Apply Ultra Fast default threads on load and when mode changes
-      applyDefaultThreads();
-      modeSelect.addEventListener('change', applyDefaultThreads);
     </script>
   </body>
   </html>

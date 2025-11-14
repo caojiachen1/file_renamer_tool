@@ -3,14 +3,14 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*.*.*'  # 触发条件：推送形如 v1.0.0 的标签
+      - 'v*.*.*'  # Trigger condition: push tags like v1.0.0
     branches:
       - main
-      - master  # 支持通过commit信息自动触发release
-  workflow_dispatch:  # 允许手动触发
+      - master  # Support auto-release via commit message
+  workflow_dispatch:  # Allow manual trigger
     inputs:
       version_type:
-        description: '版本更新类型'
+        description: 'Version update type'
         required: true
         default: 'patch'
         type: choice
@@ -19,7 +19,7 @@ on:
           - minor
           - major
       custom_version:
-        description: '自定义版本号 (例如: v2.0.1, 留空则自动递增)'
+        description: 'Custom version number (e.g., v2.0.1, leave empty for auto-increment)'
         required: false
         default: ''
 
@@ -37,111 +37,24 @@ jobs:
     - name: Setup CMake
       uses: lukka/get-cmake@latest
       
-    - name: Setup CUDA 12.8
-      id: setup_cuda
-      continue-on-error: true
-      uses: Jimver/cuda-toolkit@v0.2.26
-      with:
-        cuda: '12.8.0'
-        method: 'network'
-        # use-github-cache: false
-        # use-local-cache: false
-        # log-file-suffix: 'cuda-install.log'
-        
-    - name: Verify CUDA installation
-      id: verify_cuda
-      shell: pwsh
-      run: |
-        Write-Host "检查CUDA安装..."
-        $cuda_available = $false
-        
-        try {
-          # 检查CUDA setup步骤是否成功
-          $cuda_setup_result = "${{ steps.setup_cuda.outcome }}"
-          Write-Host "CUDA安装步骤结果: $cuda_setup_result"
-          
-          if ($cuda_setup_result -eq "failure") {
-            Write-Host "⚠ CUDA安装失败，将使用CPU模式"
-            Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
-            Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
-            return
-          }
-          
-          # 验证NVCC命令
-          $nvcc_version = nvcc --version 2>$null
-          if ($LASTEXITCODE -eq 0 -and $nvcc_version) {
-            Write-Host "✓ NVCC版本信息:"
-            Write-Host $nvcc_version
-            $cuda_available = $true
-          } else {
-            Write-Host "⚠ NVCC命令不可用"
-            Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
-            Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
-            return
-          }
-          
-          # 检查CUDA路径
-          if ($env:CUDA_PATH) {
-            Write-Host "✓ CUDA_PATH: $env:CUDA_PATH"
-            
-            # 检查关键文件
-            $cuda_lib = "$env:CUDA_PATH\lib\x64"
-            if (Test-Path $cuda_lib) {
-              Write-Host "✓ CUDA库目录存在: $cuda_lib"
-            } else {
-              Write-Host "⚠ CUDA库目录不存在: $cuda_lib"
-              $cuda_available = $false
-            }
-            
-            $cuda_include = "$env:CUDA_PATH\include"
-            if (Test-Path $cuda_include) {
-              Write-Host "✓ CUDA头文件目录存在: $cuda_include"
-            } else {
-              Write-Host "⚠ CUDA头文件目录不存在: $cuda_include"
-              $cuda_available = $false
-            }
-          } else {
-            Write-Host "⚠ CUDA_PATH环境变量未设置"
-            $cuda_available = $false
-          }
-          
-          if ($env:CUDA_HOME) {
-            Write-Host "✓ CUDA_HOME: $env:CUDA_HOME"
-          }
-          
-        } catch {
-          Write-Host "⚠ CUDA验证过程中出现异常: $($_.Exception.Message)"
-          $cuda_available = $false
-        }
-        
-        if ($cuda_available) {
-          Write-Host "🎉 CUDA环境验证成功，将编译CUDA版本"
-          Write-Output "cuda_available=true" >> $env:GITHUB_OUTPUT
-          Write-Output "build_type=cuda" >> $env:GITHUB_OUTPUT
-        } else {
-          Write-Host "⚠ CUDA环境不完整，将回退到CPU模式编译"
-          Write-Output "cuda_available=false" >> $env:GITHUB_OUTPUT
-          Write-Output "build_type=cpu" >> $env:GITHUB_OUTPUT
-        }
-      
     - name: Get version from tag or input
       id: version
       shell: pwsh
       run: |
         if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-          # 手动触发的情况
+          # Manual trigger case
           $custom_version = "${{ github.event.inputs.custom_version }}"
           
           if ($custom_version -and $custom_version.Trim() -ne "") {
-            # 使用自定义版本号
+            # Use custom version number
             $version = $custom_version.Trim()
-            Write-Host "使用自定义版本号: $version"
+            Write-Host "Using custom version: $version"
           } else {
-            # 自动递增版本号
+            # Auto-increment version number
             $version_type = "${{ github.event.inputs.version_type }}"
-            Write-Host "版本更新类型: $version_type"
+            Write-Host "Version update type: $version_type"
             
-            # 使用GitHub API获取最新的release
+            # Use GitHub API to get the latest release
             try {
               $headers = @{
                 'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
@@ -152,37 +65,37 @@ jobs:
               
               if ($response -and $response.tag_name) {
                 $latest_tag = $response.tag_name
-                Write-Host "通过API找到最新release标签: $latest_tag"
+                Write-Host "Found latest release tag via API: $latest_tag"
               } else {
-                # 如果没有release，尝试获取最新的tag
+                # If no release, try to get the latest tag
                 $tags_response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/tags" -Headers $headers -ErrorAction SilentlyContinue
                 if ($tags_response -and $tags_response.Length -gt 0) {
                   $latest_tag = $tags_response[0].name
-                  Write-Host "通过API找到最新标签: $latest_tag"
+                  Write-Host "Found latest tag via API: $latest_tag"
                 } else {
                   $latest_tag = "v2.0.0"
-                  Write-Host "未找到任何标签，使用默认版本: $latest_tag"
+                  Write-Host "No tags found, using default version: $latest_tag"
                 }
               }
             } catch {
-              # 回退到git命令
-              Write-Host "API调用失败，回退到git命令"
+              # Fallback to git command
+              Write-Host "API call failed, falling back to git command"
               $latest_tag = git describe --tags --abbrev=0 2>$null
               if (-not $latest_tag) {
                 $latest_tag = "v2.0.0"
-                Write-Host "未找到现有标签，使用默认版本: $latest_tag"
+                Write-Host "No existing tags found, using default version: $latest_tag"
               } else {
-                Write-Host "通过git找到最新标签: $latest_tag"
+                Write-Host "Found latest tag via git: $latest_tag"
               }
             }
             
-            # 解析版本号
+            # Parse version number
             if ($latest_tag -match '^v(\d+)\.(\d+)\.(\d+)$') {
               $major = [int]$matches[1]
               $minor = [int]$matches[2]
               $patch = [int]$matches[3]
               
-              # 根据类型递增版本号
+              # Increment version number based on type
               switch ($version_type) {
                 "major" { 
                   $major++
@@ -199,27 +112,27 @@ jobs:
               }
               
               $version = "v$major.$minor.$patch"
-              Write-Host "自动递增后的版本: $version"
+              Write-Host "Auto-incremented version: $version"
             } else {
-              Write-Error "无法解析版本号格式: $latest_tag"
+              Write-Error "Unable to parse version format: $latest_tag"
               exit 1
             }
           }
         } else {
-          # 推送触发的情况 (标签推送或分支推送)
+          # Push-triggered case (tag push or branch push)
           if ("${{ github.ref_type }}" -eq "tag") {
-            # 标签推送触发
+            # Tag push trigger
             $version = "${{ github.ref_name }}"
-            Write-Host "从标签获取版本: $version"
+            Write-Host "Version from tag: $version"
           } else {
-            # 分支推送触发 - 检查commit信息来确定是否需要自动发布
+            # Branch push trigger - check commit message for auto-release
             $commit_message = git log -1 --pretty=format:"%s%n%b"
-            Write-Host "检查commit信息: $commit_message"
+            Write-Host "Checking commit message: $commit_message"
             
-            # 检查commit信息中的版本控制关键词
+            # Check for version control keywords in commit message
             $auto_version_type = $null
             
-            # 优先检查末尾的[]标记
+            # Check [] markers at the end first
             if ($commit_message -match '\[major\]$') {
               $auto_version_type = "major"
             } elseif ($commit_message -match '\[minor\]$') {
@@ -227,7 +140,7 @@ jobs:
             } elseif ($commit_message -match '\[patch\]$') {
               $auto_version_type = "patch"
             }
-            # 如果没有[]标记，再检查其他关键词
+            # If no [] markers, check other keywords
             elseif ($commit_message -match '\bmajor:|\bbreaking\s*change|\bBREAKING\s*CHANGE') {
               $auto_version_type = "major"
             } elseif ($commit_message -match '\bminor:|\bfeat:|\bfeature:') {
@@ -237,17 +150,17 @@ jobs:
             }
             
             if (-not $auto_version_type) {
-              Write-Host "commit信息中未找到版本控制关键词，跳过自动发布"
-              Write-Host "支持的标记格式:"
-              Write-Host "  - 消息末尾: [major], [minor], [patch]"
-              Write-Host "  - 前缀关键词: major:, minor:, patch:, feat:, fix:, etc."
-              Write-Host "当前commit: $commit_message"
+              Write-Host "No version control keywords found in commit message, skipping auto-release"
+              Write-Host "Supported marker formats:"
+              Write-Host "  - At end of message: [major], [minor], [patch]"
+              Write-Host "  - Prefix keywords: major:, minor:, patch:, feat:, fix:, etc."
+              Write-Host "Current commit: $commit_message"
               exit 0
             }
             
-            Write-Host "从commit信息检测到版本类型: $auto_version_type"
+            Write-Host "Detected version type from commit message: $auto_version_type"
             
-            # 使用GitHub API获取最新的release来自动计算版本
+            # Use GitHub API to get latest release for auto-version calculation
             try {
               $headers = @{
                 'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
@@ -258,20 +171,20 @@ jobs:
               
               if ($response -and $response.tag_name) {
                 $latest_tag = $response.tag_name
-                Write-Host "通过API找到最新release标签: $latest_tag"
+                Write-Host "Found latest release tag via API: $latest_tag"
               } else {
-                # 如果没有release，尝试获取最新的tag
+                # If no release, try to get the latest tag
                 $tags_response = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/tags" -Headers $headers -ErrorAction SilentlyContinue
                 if ($tags_response -and $tags_response.Length -gt 0) {
                   $latest_tag = $tags_response[0].name
-                  Write-Host "通过API找到最新标签: $latest_tag"
+                  Write-Host "Found latest tag via API: $latest_tag"
                 } else {
                   $latest_tag = "v2.0.0"
-                  Write-Host "未找到任何标签，使用默认版本: $latest_tag"
+                  Write-Host "No tags found, using default version: $latest_tag"
                 }
               }
               
-              # 解析并递增版本号
+              # Parse and increment version number
               if ($latest_tag -match '^v(\d+)\.(\d+)\.(\d+)$') {
                 $major = [int]$matches[1]
                 $minor = [int]$matches[2]
@@ -293,28 +206,28 @@ jobs:
                 }
                 
                 $version = "v$major.$minor.$patch"
-                Write-Host "基于commit信息自动递增版本: $latest_tag → $version"
+                Write-Host "Auto-incremented version based on commit: $latest_tag → $version"
               } else {
-                Write-Error "无法解析版本号格式: $latest_tag"
+                Write-Error "Unable to parse version format: $latest_tag"
                 exit 1
               }
             } catch {
-              Write-Error "API调用失败，无法自动生成版本"
+              Write-Error "API call failed, unable to auto-generate version"
               exit 1
             }
           }
         }
         
-        # 确保版本格式正确 (v主版本.次版本.修订版本)
+        # Ensure version format is correct (vMajor.Minor.Patch)
         if ($version -notmatch '^v\d+\.\d+\.\d+$') {
-          Write-Error "版本格式错误。请使用 v主版本.次版本.修订版本 格式 (例如: v2.0.1)"
-          Write-Error "当前版本: $version"
+          Write-Error "Version format error. Please use vMajor.Minor.Patch format (e.g., v2.0.1)"
+          Write-Error "Current version: $version"
           exit 1
         }
         
         Write-Output "version=$version" >> $env:GITHUB_OUTPUT
         Write-Output "version_number=$($version.Substring(1))" >> $env:GITHUB_OUTPUT
-        Write-Host "最终版本: $version"
+        Write-Host "Final version: $version"
         
     - name: Update version in CMakeLists.txt
       shell: pwsh
@@ -323,7 +236,7 @@ jobs:
         $cmake_content = Get-Content CMakeLists.txt -Raw
         $cmake_content = $cmake_content -replace 'project\(FileRenamerTool VERSION \d+\.\d+\.\d+', "project(FileRenamerTool VERSION $version_number"
         Set-Content CMakeLists.txt $cmake_content
-        Write-Host "已更新 CMakeLists.txt 中的版本号为: $version_number"
+        Write-Host "Updated version in CMakeLists.txt to: $version_number"
         
     - name: Create and push tag (for manual trigger and auto release)
       if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'branch')
@@ -331,140 +244,109 @@ jobs:
       run: |
         $version = "${{ steps.version.outputs.version }}"
         
-        Write-Host "处理标签: $version"
+        Write-Host "Processing tag: $version"
         
-        # 配置git用户信息
+        # Configure git user info
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         
-        # 检查远程标签是否存在
+        # Check if remote tag exists
         $remote_tag = git ls-remote --tags origin $version 2>$null
         if ($remote_tag) {
-          Write-Host "✓ 远程标签 $version 已存在，直接复用"
+          Write-Host "✓ Remote tag $version already exists, reusing"
           
-          # 检查本地标签是否存在，如果不存在则从远程获取
+          # Check if local tag exists, fetch from remote if not
           $local_tag = git tag -l $version
           if (-not $local_tag) {
-            Write-Host "本地标签不存在，从远程获取..."
+            Write-Host "Local tag does not exist, fetching from remote..."
             git fetch origin "refs/tags/$version`:refs/tags/$version" 2>$null
-            Write-Host "✓ 已从远程获取标签 $version"
+            Write-Host "✓ Fetched tag $version from remote"
           } else {
-            Write-Host "✓ 本地标签 $version 也存在"
+            Write-Host "✓ Local tag $version also exists"
           }
         } else {
-          Write-Host "远程标签 $version 不存在，准备创建..."
+          Write-Host "Remote tag $version does not exist, preparing to create..."
           
-          # 检查本地标签是否存在
+          # Check if local tag exists
           $local_tag = git tag -l $version
           if ($local_tag) {
-            Write-Host "本地标签 $version 已存在，推送到远程..."
+            Write-Host "Local tag $version already exists, pushing to remote..."
             try {
               git push origin $version
-              Write-Host "✓ 标签 $version 已推送到远程"
+              Write-Host "✓ Tag $version pushed to remote"
             } catch {
-              Write-Host "⚠ 推送标签时出现错误，可能标签已在远程存在"
-              # 重新检查远程标签
+              Write-Host "⚠ Error pushing tag, may already exist remotely"
+              # Re-check remote tag
               $remote_check = git ls-remote --tags origin $version 2>$null
               if ($remote_check) {
-                Write-Host "✓ 确认远程标签现在存在，继续处理"
+                Write-Host "✓ Confirmed remote tag now exists, continuing"
               } else {
-                Write-Error "推送标签失败且远程仍不存在标签"
+                Write-Error "Push failed and remote tag still does not exist"
                 exit 1
               }
             }
           } else {
-            Write-Host "创建新标签: $version"
+            Write-Host "Creating new tag: $version"
             git tag $version
             if ($LASTEXITCODE -eq 0) {
-              Write-Host "✓ 本地标签 $version 创建成功"
+              Write-Host "✓ Local tag $version created successfully"
               
               try {
                 git push origin $version
-                Write-Host "✓ 标签 $version 已推送到远程"
+                Write-Host "✓ Tag $version pushed to remote"
               } catch {
-                Write-Host "⚠ 推送标签时出现错误，可能是并发创建导致"
-                # 重新检查远程标签
+                Write-Host "⚠ Error pushing tag, possibly due to concurrent creation"
+                # Re-check remote tag
                 $remote_check = git ls-remote --tags origin $version 2>$null
                 if ($remote_check) {
-                  Write-Host "✓ 确认远程标签现在存在，继续处理"
+                  Write-Host "✓ Confirmed remote tag now exists, continuing"
                 } else {
-                  Write-Error "推送标签失败且远程仍不存在标签"
+                  Write-Error "Push failed and remote tag still does not exist"
                   exit 1
                 }
               }
             } else {
-              Write-Error "创建本地标签失败"
+              Write-Error "Failed to create local tag"
               exit 1
             }
           }
         }
         
-        Write-Host "✅ 标签处理完成: $version"
+        Write-Host "✅ Tag processing completed: $version"
         
     - name: Build project
       shell: cmd
       run: |
-        echo 开始构建项目...
+        echo Starting project build...
         setlocal enabledelayedexpansion
         
-        set CUDA_AVAILABLE=${{ steps.verify_cuda.outputs.cuda_available }}
-        set BUILD_TYPE=${{ steps.verify_cuda.outputs.build_type }}
+        echo 🔧 Building CPU version ^(standard mode^)...
+        echo Configuring CMake ^(CPU mode^)...
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
+        set CMAKE_EXIT_CODE=!errorlevel!
         
-        if "%CUDA_AVAILABLE%"=="true" (
-          echo 🚀 编译CUDA版本 ^(启用GPU加速^)...
-          echo 配置CMake ^(启用CUDA^)...
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
-          set CMAKE_EXIT_CODE=!errorlevel!
-          
-          if !CMAKE_EXIT_CODE! neq 0 (
-            echo ⚠ CMake配置失败，尝试回退到CPU模式...
-            echo 重新配置CMake ^(CPU模式^)...
-            cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
-            set CMAKE_EXIT_CODE=!errorlevel!
-            
-            if !CMAKE_EXIT_CODE! neq 0 (
-              echo ❌ CMake配置完全失败！
-              exit /b !CMAKE_EXIT_CODE!
-            )
-            
-            echo ✓ 成功回退到CPU模式
-            set BUILD_TYPE=cpu
-          ) else (
-            echo ✓ CUDA版本CMake配置成功
-          )
+        if !CMAKE_EXIT_CODE! neq 0 (
+          echo ❌ CMake configuration failed!
+          exit /b !CMAKE_EXIT_CODE!
         ) else (
-          echo 🔧 编译CPU版本 ^(标准模式^)...
-          echo 配置CMake ^(CPU模式^)...
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
-          set CMAKE_EXIT_CODE=!errorlevel!
-          
-          if !CMAKE_EXIT_CODE! neq 0 (
-            echo ❌ CMake配置失败！
-            exit /b !CMAKE_EXIT_CODE!
-          ) else (
-            echo ✓ CPU版本CMake配置成功
-          )
+          echo ✓ CPU version CMake configuration successful
         )
         
-        echo 编译项目...
+        echo Building project...
         cmake --build build --config Release --verbose
         set BUILD_EXIT_CODE=!errorlevel!
         if !BUILD_EXIT_CODE! neq 0 (
-          echo ❌ 构建失败！
+          echo ❌ Build failed!
           exit /b !BUILD_EXIT_CODE!
         )
         
-        echo 复制可执行文件到根目录...
+        echo Copying executable to root directory...
         if exist "build\Release\file_renamer_cli.exe" (
           copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
-          if "%BUILD_TYPE%"=="cuda" (
-            echo ✅ CUDA版本构建完成！
-          ) else (
-            echo ✅ CPU版本构建完成！
-          )
+          echo ✅ CPU version build completed!
         ) else (
-          echo ❌ 未找到构建产物！
-          echo 查找可能的构建产物位置...
+          echo ❌ Build artifacts not found!
+          echo Searching for possible build artifact locations...
           dir /s build\*.exe 2>nul
           exit /b 1
         )
@@ -472,64 +354,55 @@ jobs:
     - name: Verify build artifacts
       shell: pwsh
       run: |
-        Write-Host "检查构建产物..."
+        Write-Host "Verifying build artifacts..."
         
         $release_exe = "build\Release\file_renamer_cli.exe"
         $root_exe = "file_renamer.exe"
         $debug_exe = "build\Debug\file_renamer_cli.exe"
         
         if (Test-Path $release_exe) {
-          Write-Host "✓ 找到 Release 版本: $release_exe"
+          Write-Host "✓ Found Release version: $release_exe"
           $size = (Get-Item $release_exe).Length
-          Write-Host "  文件大小: $([math]::Round($size/1KB, 2)) KB"
+          Write-Host "  File size: $([math]::Round($size/1KB, 2)) KB"
         } else {
-          Write-Error "✗ 未找到 Release 版本: $release_exe"
+          Write-Error "✗ Release version not found: $release_exe"
           exit 1
         }
         
         if (Test-Path $debug_exe) {
-          Write-Host "✓ 找到 Debug 版本: $debug_exe"
+          Write-Host "✓ Found Debug version: $debug_exe"
         } else {
-          Write-Host "⚠ 未找到 Debug 版本: $debug_exe"
+          Write-Host "⚠ Debug version not found: $debug_exe"
         }
         
         if (Test-Path $root_exe) {
-          Write-Host "✓ 找到根目录副本: $root_exe"
+          Write-Host "✓ Found root directory copy: $root_exe"
         } else {
-          Write-Host "⚠ 未找到根目录副本: $root_exe"
+          Write-Host "⚠ Root directory copy not found: $root_exe"
         }
         
     - name: Prepare release assets
       id: prepare_release_assets
       shell: pwsh
       run: |
-        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
-        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
+        Write-Host "Preparing release files (CPU version)..."
+        $build_description = "cpu"
+        $performance_note = "Standard CPU version"
         
-        if ($cuda_available -eq "true") {
-          Write-Host "准备发布文件 (CUDA版本)..."
-          $build_description = "cuda12.8"
-          $performance_note = "GPU加速版本"
-        } else {
-          Write-Host "准备发布文件 (CPU版本)..."
-          $build_description = "cpu"
-          $performance_note = "标准CPU版本"
-        }
-        
-        # 创建发布目录
+        # Create release directory
         New-Item -ItemType Directory -Force -Path "release-assets"
         
-        # 复制主要可执行文件
+        # Copy the main executable file
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
         Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
         
-        Write-Host "发布文件准备完成 ($performance_note)："
+        Write-Host "Release file preparation complete ($performance_note):"
         Get-ChildItem "release-assets" | ForEach-Object {
           Write-Host "  - $($_.Name) ($([math]::Round($_.Length/1KB, 2)) KB)"
         }
         
-        # 输出构建类型供后续步骤使用
+        # Output build type information for subsequent steps
         Write-Output "build_description=$build_description" >> $env:GITHUB_OUTPUT
         Write-Output "performance_note=$performance_note" >> $env:GITHUB_OUTPUT
         
@@ -537,43 +410,20 @@ jobs:
       shell: pwsh
       run: |
         $version = "${{ steps.version.outputs.version }}"
-        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
-        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
-        
-        # 获取最新的commit信息
+
+        # Get the latest commit information
         $commit_message = git log -1 --pretty=format:"%s"
         $commit_body = git log -1 --pretty=format:"%b"
         $commit_hash = git log -1 --pretty=format:"%h"
         
-        # 创建发布说明
+        # Create release notes
         $content = @()
         
-        if ($cuda_available -eq "true") {
-          $content += "## 📦 File Renamer CLI Tool $version (CUDA 12.8)"
-          $content += ""
-          $content += "🚀 **GPU加速版本** - 支持NVIDIA GPU并行计算，显著提升大文件批量重命名性能"
-          $gpu_requirements = @(
-            "- Windows 10/11 (x64)"
-            "- NVIDIA GPU (支持CUDA 12.8)"
-            "- 兼容的显卡驱动程序"
-          )
-          $fallback_note = "**注意：** 如果系统没有兼容的NVIDIA GPU，程序会自动回退到CPU模式运行"
-        } else {
-          $content += "## 📦 File Renamer CLI Tool $version (CPU版本)"
-          $content += ""
-          $content += "🔧 **标准CPU版本** - 兼容所有Windows系统，稳定可靠的文件重命名工具"
-          $gpu_requirements = @(
-            "- Windows 10/11 (x64)"
-            "- 无需额外GPU要求"
-          )
-          $fallback_note = "**说明：** 此版本为CPU优化版本，在所有Windows系统上都能稳定运行"
-        }
+        $content += "## 📦 File Renamer CLI Tool $version (CPU Version)"
         
-        $content += ""
-        
-        # 添加commit信息
+        # Add commit information
         if ($commit_message) {
-          $content += "## 更新内容"
+          $content += "## Update Notes"
           $content += "- $commit_message"
           if ($commit_body -and $commit_body.Trim() -ne "") {
             $commit_body.Split("`n") | ForEach-Object {
@@ -586,33 +436,9 @@ jobs:
           $content += "*Commit: $commit_hash*"
           $content += ""
         }
-        
-        # 添加使用说明
-        $content += "## 使用方法"
-        $content += ""
-        $content += "**预览模式**"
-        $content += '```cmd'
-        $content += 'file_renamer.exe "C:\MyFiles" -x jpg,png'
-        $content += '```'
-        $content += ""
-        $content += "**执行重命名：**"
-        $content += '```cmd'
-        $content += 'file_renamer.exe "C:\MyFiles" -x jpg,png -e'
-        $content += '```'
-        $content += ""
-        $content += "**更多选项：**"
-        $content += '```cmd'
-        $content += 'file_renamer.exe --help'
-        $content += '```'
-        $content += ""
-        $content += "## 系统要求"
-        $gpu_requirements | ForEach-Object { $content += $_ }
-        $content += ""
-        $content += $fallback_note
-        
         $content | Out-File "release-notes.md" -Encoding UTF8
-        Write-Host "发布说明已生成 ($build_type 版本)"
-        
+        Write-Host "Release notes generated (cpu version)"
+
     - name: Create Release
       id: create_release
       shell: pwsh
@@ -620,22 +446,22 @@ jobs:
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "File Renamer CLI Tool $version"
         
-        # 检查Release是否已存在
+        # Check if the Release already exists
         try {
           $headers = @{
             'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
             'Accept' = 'application/vnd.github.v3+json'
           }
           
-          Write-Host "检查Release是否存在: $version"
+          Write-Host "Checking if Release exists: $version"
           $existing_release = $null
           
           try {
             $existing_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$version" -Headers $headers
-            Write-Host "找到现有Release: $version"
+            Write-Host "Found existing Release: $version"
           } catch {
             if ($_.Exception.Response.StatusCode -eq 404) {
-              Write-Host "Release $version 不存在，将创建新Release"
+              Write-Host "Release $version does not exist, creating a new Release"
               $existing_release = $null
             } else {
               throw $_.Exception
@@ -643,19 +469,19 @@ jobs:
           }
           
           if ($existing_release) {
-            Write-Host "Release $version 已存在，复用现有Release"
+            Write-Host "Release $version already exists, reusing the existing Release"
             Write-Host "Release ID: $($existing_release.id)"
             Write-Host "Release URL: $($existing_release.html_url)"
             
-            # 输出现有Release信息供后续步骤使用
+            # Output existing Release information for subsequent steps
             Write-Output "upload_url=$($existing_release.upload_url)" >> $env:GITHUB_OUTPUT
             Write-Output "html_url=$($existing_release.html_url)" >> $env:GITHUB_OUTPUT
             Write-Output "id=$($existing_release.id)" >> $env:GITHUB_OUTPUT
             Write-Output "created=false" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "创建新Release: $version"
+            Write-Host "Creating a new Release: $version"
             
-            # 读取release notes
+            # Read release notes
             $body = Get-Content "release-notes.md" -Raw -Encoding UTF8
             
             $release_data = @{
@@ -669,20 +495,20 @@ jobs:
             
             $new_release = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases" -Method POST -Headers $headers -Body $release_data
             
-            Write-Host "新Release已创建"
+            Write-Host "New Release created"
             Write-Host "Release ID: $($new_release.id)"
             Write-Host "Release URL: $($new_release.html_url)"
             
-            # 输出新Release信息供后续步骤使用
+            # Output new Release information for subsequent steps
             Write-Output "upload_url=$($new_release.upload_url)" >> $env:GITHUB_OUTPUT
             Write-Output "html_url=$($new_release.html_url)" >> $env:GITHUB_OUTPUT
             Write-Output "id=$($new_release.id)" >> $env:GITHUB_OUTPUT
             Write-Output "created=true" >> $env:GITHUB_OUTPUT
           }
         } catch {
-          Write-Error "处理Release时出错: $($_.Exception.Message)"
-          Write-Error "状态码: $($_.Exception.Response.StatusCode)"
-          Write-Error "详细信息: $($_.Exception.Response.StatusDescription)"
+          Write-Error "Error processing Release: $($_.Exception.Message)"
+          Write-Error "Status code: $($_.Exception.Response.StatusCode)"
+          Write-Error "Status description: $($_.Exception.Response.StatusDescription)"
           exit 1
         }
         
@@ -695,9 +521,9 @@ jobs:
         $asset_path = "release-assets/$asset_name"
         $upload_url = "${{ steps.create_release.outputs.upload_url }}"
         
-        # 检查文件是否存在
+        # Check if file exists
         if (-not (Test-Path $asset_path)) {
-          Write-Error "找不到要上传的文件: $asset_path"
+          Write-Error "File to upload not found: $asset_path"
           exit 1
         }
         
@@ -707,11 +533,11 @@ jobs:
             'Content-Type' = 'application/octet-stream'
           }
           
-          # 检查Release中是否已存在同名文件
+          # Check if file with same name already exists in Release
           $release_id = "${{ steps.create_release.outputs.id }}"
           $assets_url = "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets"
           
-          Write-Host "检查现有文件..."
+          Write-Host "Checking existing files..."
           try {
             $existing_assets = Invoke-RestMethod -Uri $assets_url -Headers @{
               'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
@@ -721,45 +547,45 @@ jobs:
             $existing_asset = $existing_assets | Where-Object { $_.name -eq $asset_name }
             
             if ($existing_asset) {
-              Write-Host "文件 $asset_name 已存在于Release中，删除旧版本"
+              Write-Host "File $asset_name already exists in Release, deleting old version"
               $delete_url = "https://api.github.com/repos/${{ github.repository }}/releases/assets/$($existing_asset.id)"
               Invoke-RestMethod -Uri $delete_url -Method DELETE -Headers @{
                 'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
               }
-              Write-Host "旧版本已删除"
+              Write-Host "Old version deleted"
             } else {
-              Write-Host "文件 $asset_name 不存在，准备上传新文件"
+              Write-Host "File $asset_name does not exist, preparing to upload new file"
             }
           } catch {
-            Write-Host "检查现有文件时出错，继续上传: $($_.Exception.Message)"
+            Write-Host "Error checking existing files, continuing with upload: $($_.Exception.Message)"
           }
           
-          # 准备上传URL
+          # Prepare upload URL
           $upload_url_clean = $upload_url -replace '\{\?name,label\}', "?name=$asset_name"
-          Write-Host "上传URL: $upload_url_clean"
+          Write-Host "Upload URL: $upload_url_clean"
           
-          # 读取文件并上传
+          # Read file and upload
           $file_bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $asset_path))
-          Write-Host "文件大小: $([math]::Round($file_bytes.Length/1KB, 2)) KB"
+          Write-Host "File size: $([math]::Round($file_bytes.Length/1KB, 2)) KB"
           
           $response = Invoke-RestMethod -Uri $upload_url_clean -Method POST -Headers $headers -Body $file_bytes
           
-          Write-Host "✓ 文件上传成功: $asset_name"
-          Write-Host "  下载URL: $($response.browser_download_url)"
-          Write-Host "  文件大小: $([math]::Round($response.size/1KB, 2)) KB"
+          Write-Host "✓ File upload successful: $asset_name"
+          Write-Host "  Download URL: $($response.browser_download_url)"
+          Write-Host "  File size: $([math]::Round($response.size/1KB, 2)) KB"
           
         } catch {
-          Write-Error "上传文件失败: $($_.Exception.Message)"
-          Write-Error "状态码: $($_.Exception.Response.StatusCode)"
-          Write-Error "状态描述: $($_.Exception.Response.StatusDescription)"
+          Write-Error "File upload failed: $($_.Exception.Message)"
+          Write-Error "Status code: $($_.Exception.Response.StatusCode)"
+          Write-Error "Status description: $($_.Exception.Response.StatusDescription)"
           
           if ($_.Exception.Response) {
             try {
               $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
               $responseBody = $reader.ReadToEnd()
-              Write-Error "响应内容: $responseBody"
+              Write-Error "Response content: $responseBody"
             } catch {
-              Write-Host "无法读取响应内容"
+              Write-Host "Unable to read response content"
             }
           }
           exit 1
@@ -769,45 +595,24 @@ jobs:
       shell: pwsh
       run: |
         $created = "${{ steps.create_release.outputs.created }}"
-        $action = if ($created -eq "true") { "创建" } else { "复用" }
-        $build_type = "${{ steps.verify_cuda.outputs.build_type }}"
-        $cuda_available = "${{ steps.verify_cuda.outputs.cuda_available }}"
+        $action = if ($created -eq "true") { "Created" } else { "Reused" }
         $performance_note = "${{ steps.prepare_release_assets.outputs.performance_note }}"
         
-        Write-Host "🎉 构建和发布完成！"
+        Write-Host "🎉 Build and release completed!"
         Write-Host ""
-        Write-Host "📋 构建摘要:"
-        Write-Host "  版本: ${{ steps.version.outputs.version }}"
+        Write-Host "📋 Build Summary:"
+        Write-Host "  Version: ${{ steps.version.outputs.version }}"
+
+        Write-Host "  Build Type: CPU Standard Version"
         
-        if ($cuda_available -eq "true") {
-          Write-Host "  构建类型: CUDA加速版本"
-          Write-Host "  CUDA版本: 12.8"
-          Write-Host "  GPU加速: 已启用"
-        } else {
-          Write-Host "  构建类型: CPU标准版本"
-          Write-Host "  GPU加速: 不可用/已跳过"
-        }
-        
-        Write-Host "  Release操作: $action"
-        Write-Host "  发布URL: ${{ steps.create_release.outputs.html_url }}"
+        Write-Host "  Release Operation: $action"
+        Write-Host "  Release URL: ${{ steps.create_release.outputs.html_url }}"
         Write-Host ""
-        Write-Host "📦 发布的文件:"
+        Write-Host "📦 Released Files:"
         Get-ChildItem "release-assets" | ForEach-Object {
           Write-Host "  ✓ $($_.Name)"
         }
         Write-Host ""
-        Write-Host "🔗 下载链接:"
-        Write-Host "  Release页面: ${{ steps.create_release.outputs.html_url }}"
+        Write-Host "🔗 Download Links:"
+        Write-Host "  Release Page: ${{ steps.create_release.outputs.html_url }}"
         Write-Host ""
-        
-        if ($cuda_available -eq "true") {
-          Write-Host "⚡ 性能特性:"
-          Write-Host "  • GPU并行哈希计算"
-          Write-Host "  • 支持Maxwell到Blackwell架构"
-          Write-Host "  • 自动CPU/GPU模式切换"
-        } else {
-          Write-Host "🔧 版本特性:"
-          Write-Host "  • 全系统兼容性"
-          Write-Host "  • 稳定的CPU处理"
-          Write-Host "  • 无额外依赖要求"
-        }

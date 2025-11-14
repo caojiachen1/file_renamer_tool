@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(FileRenamerTool VERSION 1.0.0 LANGUAGES CXX)
 
+# Prefer PowerShell Core (pwsh) if available, otherwise fall back to Windows PowerShell
+find_program(PWSH_EXECUTABLE NAMES pwsh pwsh.exe)
+if(PWSH_EXECUTABLE)
+    set(CMAKE_VS_MSBUILD_COMMAND "${PWSH_EXECUTABLE}")
+else()
+    set(CMAKE_VS_MSBUILD_COMMAND "powershell.exe")
+endif()
+
 # Require Visual Studio 2022 (MSVC v143) or later
 if(NOT MSVC OR MSVC_VERSION LESS 1930)
     message(FATAL_ERROR "This project requires Visual Studio 2022 (MSVC v143) or later")

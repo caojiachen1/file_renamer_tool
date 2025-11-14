@@ -65,16 +65,12 @@ def build_args(payload: dict) -> List[str]:
     if algorithm != "MD5":
         args += ["-a", algorithm]
 
-    # Mode
-    mode = (payload.get("mode") or "ultra-fast").lower()
+    # Mode (ultra-fast multi-thread is the default)
+    mode = (payload.get("mode") or "multi-thread").lower()
     if mode == "single-thread":
         args += ["--single-thread"]
-    elif mode == "multi-thread":
-        args += ["--multi-thread"]
     elif mode == "batch-mode":
         args += ["--batch-mode"]
-    else:
-        args += ["--ultra-fast"]
 
     # Recursive
     if bool(payload.get("recursive")):
@@ -99,15 +95,6 @@ def build_args(payload: dict) -> List[str]:
     threads = payload.get("threads")
     if threads:
         args += ["-t", str(int(threads))]
-    else:
-        # Ultra-fast mode by default uses all available logical CPUs if not specified
-        if (payload.get("mode") or "ultra-fast").lower() == "ultra-fast":
-            try:
-                cpu_threads = os.cpu_count() or 0
-            except Exception:
-                cpu_threads = 0
-            if cpu_threads > 0:
-                args += ["-t", str(cpu_threads)]
     batch = payload.get("batch")
     if batch:
         args += ["-b", str(int(batch))]

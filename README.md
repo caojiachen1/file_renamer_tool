@@ -12,9 +12,9 @@ A command-line utility for batch renaming files using hash algorithms (MD5, SHA1
 - **Multi-threading**: Optimized CPU processing with configurable thread count
 - **Cross-platform**: Windows support with Visual Studio 2022
 
-## Device Selection
+## Runtime Device
 
-The executable `file_renamer.exe` runs on CPU. Device selection flags allow you to choose CPU, auto selection, or list devices.
+The current CLI only supports CPU execution with multi-threading.
 
 ## Requirements
 
@@ -32,71 +32,57 @@ The executable `file_renamer.exe` runs on CPU. Device selection flags allow you 
    build.bat
    ```
 
-### Usage
+### CLI Usage
 
-`file_renamer.exe` supports device selection:
+Basic invocation:
+
+```cmd
+file_renamer_cli.exe <directory> [options]
+```
+
+Or, depending on your build output:
 
 ```cmd
 file_renamer.exe <directory> [options]
 ```
 
-#### Device Selection Options
-
-- `-d, --device <specification>` - Choose processing mode:
-   - `auto` - Auto-select (default)
-   - `cpu` or `-1` - Force CPU processing
-   - `0`, `1`, `2`, ... - Reserved numeric ids (mapped internally)
-   - `list` - Show available logical devices
-
 #### Core Options
 
-- `-a, --algorithm <hash>` - Hash algorithm (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B) [default: MD5]
-- `-r, --recursive` - Scan subdirectories recursively
-- `-e, --execute` - Execute renaming (default is preview mode)
-- `-x, --extensions <ext>` - Only process files with specified extensions
-- `-t, --threads <n>` - Number of processing threads [default: auto]
-- `-q, --quick` - Enable quick check for already-named files
-- `--ultra-fast` - Enable ultra-fast pipeline (aggressive I/O + scheduling)
-   - By default uses ALL logical CPU threads for maximum throughput (you can override with `-t`)
-- `--extreme` - Extreme performance mode (very aggressive auto-tuning; higher RAM/VRAM & I/O usage)
-- `-y, --yes` - Auto-confirm without user interaction
-- `-h, --help` - Show help message
+- `-a, --algorithm <hash>`: Hash algorithm (`MD5`, `SHA1`, `SHA256`, `SHA512`, `CRC32`, `BLAKE2B`), default is `MD5`
+- `-r, --recursive`: Scan subdirectories recursively
+- `-e, --execute`: Actually perform renaming (default is preview-only)
+- `-x, --extensions <ext>`: Only process files with given extensions, e.g. `jpg,png,txt` or `.jpg,.png,.txt`
+- `-q, --quick`: Enable quick check (skip files that already look correctly hash-named, default on)
+- `--no-quick`: Disable quick check and force full hash calculation for all files
+- `-y, --yes`: Auto-confirm without interactive prompts
+- `-t, --threads <n>`: Number of worker threads; default is auto-detected from CPU cores
+- `-b, --batch <n>`: Batch size (files per batch in batch mode); default is auto-calculated
+- `--buffer-kb <n>`: Streaming I/O buffer size in KB; default is auto
+- `--mmap-chunk-mb <n>`: Memory-mapped feed chunk size in MB; default is auto
+- `--single-thread`: Use single-threaded processing (original sequential mode)
+- `--multi-thread`: Use multi-threaded processing
+- `--batch-mode`: Use batch processing mode (best for huge file sets)
+<!-- `--extreme`: Extreme performance tuning (removed; kept as a backward-compatible no-op flag in CLI) -->
+- `-h, --help`: Show help message
 
 #### Examples
 
-**Device Selection:**
-```cmd
-# List all available devices
-file_renamer.exe C:\MyFiles -d list
-
-# Auto-select best device (default)
-file_renamer.exe C:\MyFiles
-
-# Force CPU processing
-file_renamer.exe C:\MyFiles -d cpu
-file_renamer.exe C:\MyFiles -d -1
-
-# Use specific numeric id
-file_renamer.exe C:\MyFiles -d 0
-file_renamer.exe C:\MyFiles -d 1 -a SHA256
-```
-
-**Basic Operations:**
+**Basic examples:**
 ```cmd
 # Preview all files with MD5
-file_renamer.exe C:\MyFiles
+file_renamer_cli.exe C:\MyFiles
 
 # Preview only jpg and png files
-file_renamer.exe C:\MyFiles -x jpg,png
+file_renamer_cli.exe C:\MyFiles -x jpg,png
 
-# Execute renaming with SHA256, recursive, using id 0
-file_renamer.exe C:\MyFiles -a SHA256 -r -e -d 0
+# Execute renaming with SHA256, recursive
+file_renamer_cli.exe C:\MyFiles -a SHA256 -r -e
 
-# Execute renaming for txt files using CPU, 8 threads
-file_renamer.exe C:\MyFiles -e -x txt -d cpu -t 8
+# Execute renaming for txt files using 8 threads
+file_renamer_cli.exe C:\MyFiles -e -x txt -t 8
 
 # Auto-confirm execution with quick check
-file_renamer.exe C:\MyFiles -e -y -q
+file_renamer_cli.exe C:\MyFiles -e -y -q
 ```
 
 ## How It Works
@@ -122,7 +108,7 @@ The tool processes files as follows:
 
 ## Auto-tuned Defaults (Fastest by default)
 
-When you don’t specify tuning flags, the tool picks aggressive, high-throughput defaults based on your hardware:
+When you don’t specify tuning flags, the tool picks aggressive, high-throughput defaults based on your hardware, and runs in ultra-fast mode by default (thread pool + CPU affinity):
 
 - I/O buffer (`--buffer-kb`): 2–4 MB depending on system RAM (≥8GB → 4MB)
 - mmap feed chunk (`--mmap-chunk-mb`): 8–16 MB depending on system RAM (≥8GB → 16MB)
@@ -131,32 +117,16 @@ When you don’t specify tuning flags, the tool picks aggressive, high-throughpu
 
 You can override any of these at runtime by passing the corresponding flag.
 
-## Extreme mode (--extreme)
+## Auto-tuned performance
 
-For maximum throughput, add `--extreme`. This applies an even more aggressive tuning profile on top of the auto defaults:
+The CLI automatically tunes threads, I/O buffer, and mmap chunk sizes based on system RAM. The deprecated `--extreme` flag is accepted for backward compatibility but no longer changes behavior; for more control, explicitly set:
 
-- Threads: up to 4× logical cores (capped at 96)
-- Batch size: 6 × threads
-- I/O buffer (`--buffer-kb`): 4–8 MB (RAM-dependent)
-- mmap feed chunk (`--mmap-chunk-mb`): 16–32 MB (RAM-dependent)
+- `-t, --threads <n>`
+- `-b, --batch <n>`
+- `--buffer-kb <n>`
+- `--mmap-chunk-mb <n>`
 
-Notes:
-- `--extreme` increases memory and I/O pressure; ensure your system has sufficient RAM and fast storage.
-- Any explicit flag you pass (e.g., `-t`, `--buffer-kb`) overrides the auto/`--extreme` values.
-
-### Examples
-
-Preview, ultra-fast + extreme, auto device selection:
-```cmd
-file_renamer.exe C:\MyFiles --ultra-fast --extreme -d auto -q -r
-```
-
-Note: In ultra-fast mode, if you do not explicitly specify `-t`, the tool will default to using ALL logical CPU threads (`std::thread::hardware_concurrency()`).
-
-Execute on id 0 with extreme tuning and SHA256:
-```cmd
-file_renamer.exe C:\MyFiles -a SHA256 -e -r -d 0 --ultra-fast --extreme -y
-```
+Note: By default, if you do not specify `-t`, the tool uses `std::thread::hardware_concurrency()` threads (all logical CPU cores).
 
 ## Web Interface (Local)
 
@@ -171,8 +141,6 @@ The project includes a simple local Web UI for visual configuration and executio
 2. Open your browser at `http://127.0.0.1:5000`.
 3. Fill in: directory path, algorithm, mode, device (auto / CPU / GPU id), recursive option, execute (default is preview), threads / batch size, extension filters, and optional advanced parameters.
 4. Click "Run" to view streaming output; you can click "Stop" at any time.
-
-Device list: Clicking the "Refresh" button triggers `-d list` and displays available device IDs.
 
 ### Executable Lookup Order
 
