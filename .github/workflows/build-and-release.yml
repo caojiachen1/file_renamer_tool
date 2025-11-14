@@ -41,6 +41,9 @@ jobs:
       id: version
       shell: pwsh
       run: |
+        # Default: do not create tag unless we explicitly decide to
+        Write-Output "should_create_tag=false" >> $env:GITHUB_OUTPUT
+
         if ("${{ github.event_name }}" -eq "workflow_dispatch") {
           # Manual trigger case
           $custom_version = "${{ github.event.inputs.custom_version }}"
@@ -49,6 +52,7 @@ jobs:
             # Use custom version number
             $version = $custom_version.Trim()
             Write-Host "Using custom version: $version"
+            Write-Output "should_create_tag=true" >> $env:GITHUB_OUTPUT
           } else {
             # Auto-increment version number
             $version_type = "${{ github.event.inputs.version_type }}"
@@ -113,6 +117,7 @@ jobs:
               
               $version = "v$major.$minor.$patch"
               Write-Host "Auto-incremented version: $version"
+              Write-Output "should_create_tag=true" >> $env:GITHUB_OUTPUT
             } else {
               Write-Error "Unable to parse version format: $latest_tag"
               exit 1
@@ -124,6 +129,7 @@ jobs:
             # Tag push trigger
             $version = "${{ github.ref_name }}"
             Write-Host "Version from tag: $version"
+            # For tag pushes, we do not create tags, only reuse existing
           } else {
             # Branch push trigger - check commit message for auto-release
             $commit_message = git log -1 --pretty=format:"%s%n%b"
@@ -132,7 +138,7 @@ jobs:
             # Check for version control keywords in commit message
             $auto_version_type = $null
             
-            # Check [] markers at the end first
+            # Check [] markers at the end first (highest priority)
             if ($commit_message -match '\[major\]$') {
               $auto_version_type = "major"
             } elseif ($commit_message -match '\[minor\]$') {
@@ -140,20 +146,24 @@ jobs:
             } elseif ($commit_message -match '\[patch\]$') {
               $auto_version_type = "patch"
             }
-            # If no [] markers, check other keywords
-            elseif ($commit_message -match '\bmajor:|\bbreaking\s*change|\bBREAKING\s*CHANGE') {
-              $auto_version_type = "major"
-            } elseif ($commit_message -match '\bminor:|\bfeat:|\bfeature:') {
-              $auto_version_type = "minor"
-            } elseif ($commit_message -match '\bpatch:|\bfix:|\bbugfix:') {
-              $auto_version_type = "patch"
+
+            # If no [] markers, infer from conventional keywords
+            if (-not $auto_version_type) {
+              if ($commit_message -match '\bmajor:|\bbreaking\s*change|\bBREAKING\s*CHANGE') {
+                $auto_version_type = "major"
+              } elseif ($commit_message -match '\bpatch:|\bfix:|\bbugfix:') {
+                $auto_version_type = "patch"
+              } else {
+                # Default: treat as minor when no explicit markers
+                $auto_version_type = "minor"
+              }
             }
-            
+
             if (-not $auto_version_type) {
               Write-Host "No version control keywords found in commit message, skipping auto-release"
               Write-Host "Supported marker formats:"
               Write-Host "  - At end of message: [major], [minor], [patch]"
-              Write-Host "  - Prefix keywords: major:, minor:, patch:, feat:, fix:, etc."
+              Write-Host "  - Prefix keywords: major:, minor:, patch:, feat:, fix:, etc. (no marker = minor)"
               Write-Host "Current commit: $commit_message"
               exit 0
             }
@@ -207,6 +217,7 @@ jobs:
                 
                 $version = "v$major.$minor.$patch"
                 Write-Host "Auto-incremented version based on commit: $latest_tag → $version"
+                Write-Output "should_create_tag=true" >> $env:GITHUB_OUTPUT
               } else {
                 Write-Error "Unable to parse version format: $latest_tag"
                 exit 1
@@ -239,7 +250,7 @@ jobs:
         Write-Host "Updated version in CMakeLists.txt to: $version_number"
         
     - name: Create and push tag (for manual trigger and auto release)
-      if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'branch')
+      if: steps.version.outputs.should_create_tag == 'true'
       shell: pwsh
       run: |
         $version = "${{ steps.version.outputs.version }}"
