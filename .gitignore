@@ -1,6 +1,5 @@
-# Node / Tauri
+# Node
 node_modules/
-src-tauri/target/
 target/
 
 # Python venv (if any)

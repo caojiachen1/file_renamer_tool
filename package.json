@@ -1,14 +1,6 @@
 {
-  "name": "file-renamer-tauri",
+  "name": "file-renamer-web",
   "private": true,
   "version": "0.1.0",
-  "description": "Tauri desktop app for File Renamer Tool",
-  "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
-    "tauri": "tauri"
-  },
-  "devDependencies": {
-    "@tauri-apps/cli": "^1.6.0"
-  }
+  "description": "Web interface for File Renamer Tool"
 }
