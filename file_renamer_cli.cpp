@@ -813,21 +813,13 @@ public:
         bool needsRename;
     };
 
-    static FileHashResult ProcessSingleFile(const fs::path& filePath, const std::string& algorithm, bool quickCheck) {
+    static FileHashResult ProcessSingleFile(const fs::path& filePath, const std::string& algorithm) {
         FileHashResult result;
         result.originalPath = filePath;
         result.success = false;
         result.needsRename = false;
         
         try {
-            // Quick check optimization
-            if (quickCheck && QuickHashCheck(filePath, algorithm)) {
-                result.success = true;
-                result.needsRename = false;
-                result.hash = "quick_skip";
-                return result;
-            }
-            
             std::string hash = CalculateFileHashOptimized(filePath, algorithm);
             if (hash.empty()) {
                 result.error = "Could not calculate hash";
@@ -919,86 +911,6 @@ public:
         }
     }
     
-    // Check if filename looks like a valid hash
-    static bool IsValidHashFilename(const std::string& filename, const std::string& algorithm) {
-        size_t expectedLength;
-        if (algorithm == "MD5") {
-            expectedLength = 32;
-        } else if (algorithm == "SHA1") {
-            expectedLength = 40;
-        } else if (algorithm == "SHA256") {
-            expectedLength = 64;
-        } else if (algorithm == "SHA512") {
-            expectedLength = 128;
-        } else if (algorithm == "CRC32") {
-            expectedLength = 8;
-        } else if (algorithm == "BLAKE2B") {
-            expectedLength = 64; // 32 bytes * 2 hex chars = 64 chars
-        } else {
-            return false; // Unknown algorithm
-        }
-        
-        if (filename.length() < expectedLength) {
-            return false;
-        }
-        
-        // Check if first part is all hex characters
-        for (size_t i = 0; i < expectedLength; i++) {
-            char c = filename[i];
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-                return false;
-            }
-        }
-        
-        return true;
-    }
-    
-    // Fast verification using partial hash (first 1KB of file)
-    static std::string CalculatePartialHash(const fs::path& filePath, const std::string& algorithm = "MD5") {
-        std::ifstream file(filePath, std::ios::binary);
-        if (!file.is_open()) {
-            return "";
-        }
-        
-        const size_t PARTIAL_SIZE = 1024; // Read first 1KB for quick verification
-        std::vector<BYTE> buffer(PARTIAL_SIZE);
-        
-        file.read(reinterpret_cast<char*>(buffer.data()), PARTIAL_SIZE);
-        std::streamsize bytesRead = file.gcount();
-        
-        if (bytesRead <= 0) {
-            return "";
-        }
-        
-        buffer.resize(static_cast<size_t>(bytesRead));
-        
-        return CalculateHash(buffer, algorithm);
-    }
-    
-    // Check if file likely already has correct hash name (quick check)
-    static bool QuickHashCheck(const fs::path& filePath, const std::string& algorithm) {
-        std::string stem = filePath.stem().u8string();
-        
-        // Convert to lowercase for comparison
-        std::transform(stem.begin(), stem.end(), stem.begin(), ::tolower);
-        
-        if (!IsValidHashFilename(stem, algorithm)) {
-            return false;
-        }
-        
-        // Quick partial hash check
-        std::string partialHash = CalculatePartialHash(filePath, algorithm);
-        if (partialHash.empty()) {
-            return false;
-        }
-        
-        // Convert partial hash to lowercase
-        std::transform(partialHash.begin(), partialHash.end(), partialHash.begin(), ::tolower);
-        
-        // Check if stem starts with partial hash (first 8 characters)
-        return stem.substr(0, 8) == partialHash.substr(0, 8);
-    }
-
     static bool ShouldProcessFile(const fs::path& filePath, const std::vector<std::string>& allowedExtensions) {
         if (allowedExtensions.empty()) {
             return true; // Process all files if no filter specified
@@ -1058,7 +970,7 @@ public:
     }
     
     // Multi-threaded processing with buffered output to prevent output mixing
-    static void ProcessDirectoryMultiThreaded(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true, int numThreads = 0) {
+    static void ProcessDirectoryMultiThreaded(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, int numThreads = 0) {
         auto startTime = std::chrono::high_resolution_clock::now();
         
         fs::path dir(directoryPath);
@@ -1078,7 +990,6 @@ public:
         std::cout << "Algorithm: " << algorithm << std::endl;
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
-        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Threads: " << numThreads << std::endl;
         
         std::cout << "Processing device: CPU" << std::endl;
@@ -1115,7 +1026,6 @@ public:
         std::atomic<int> successCount{0};
         std::atomic<int> skippedCount{0};
         std::atomic<int> noChangeCount{0};
-        std::atomic<int> quickSkipCount{0};
         std::atomic<int> currentIndex{0};
         
         // Output buffer system to prevent mixing
@@ -1162,19 +1072,6 @@ public:
                         buffer << "  Status: Skipped (extension not in filter)" << std::endl;
                         buffer << std::endl;
                         skippedCount++;
-                        
-                        // Store in output buffer
-                        outputBuffers[fileIndex].content = buffer.str();
-                        outputBuffers[fileIndex].fileIndex = fileIndex;
-                        outputBuffers[fileIndex].ready = true;
-                        continue;
-                    }
-                    
-                    // Quick check optimization for files that likely already have correct hash names
-                    if (quickCheck && QuickHashCheck(file, algorithm)) {
-                        buffer << "  Status: Likely already correctly named (quick check passed)" << std::endl;
-                        buffer << std::endl;
-                        quickSkipCount++;
                         
                         // Store in output buffer
                         outputBuffers[fileIndex].content = buffer.str();
@@ -1282,9 +1179,6 @@ public:
         std::cout << "Total files: " << files.size() << std::endl;
         std::cout << "Processed: " << processedCount.load() << std::endl;
         std::cout << "Skipped (filter): " << skippedCount.load() << std::endl;
-        if (quickCheck) {
-            std::cout << "Quick-skipped (likely correct): " << quickSkipCount.load() << std::endl;
-        }
         std::cout << "No change needed: " << noChangeCount.load() << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount.load() << std::endl;
@@ -1301,14 +1195,10 @@ public:
                       << filesPerSecond << " files/second" << std::endl;
         }
         
-        if (quickCheck && quickSkipCount.load() > 0) {
-            std::cout << "Time saved by quick check: ~" << (quickSkipCount.load() * 10) << "ms (estimated)" << std::endl;
-        }
-        
         std::cout << "Performance: " << numThreads << " threads utilized with sequential output" << std::endl;
     }
 
-    static void ProcessDirectory(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true) {
+    static void ProcessDirectory(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}) {
         auto startTime = std::chrono::high_resolution_clock::now();
         
         fs::path dir(directoryPath);
@@ -1322,7 +1212,6 @@ public:
         std::cout << "Algorithm: " << algorithm << std::endl;
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
-        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         
         // Display device status
         
@@ -1354,12 +1243,11 @@ public:
         int successCount = 0;
         int skippedCount = 0;
         int noChangeCount = 0;
-        int quickSkipCount = 0;
         
         for (const auto& file : files) {
             try {
                 std::string fileName = file.filename().u8string();
-                std::cout << "[" << (processedCount + skippedCount + quickSkipCount + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
+                std::cout << "[" << (processedCount + skippedCount + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
                 
                 // Check if file extension matches filter
                 if (!ShouldProcessFile(file, allowedExtensions)) {
@@ -1371,16 +1259,8 @@ public:
                     continue;
                 }
                 
-                // Quick check optimization for files that likely already have correct hash names
-                if (quickCheck && QuickHashCheck(file, algorithm)) {
-                    std::cout << "  Status: Likely already correctly named (quick check passed)" << std::endl;
-                    quickSkipCount++;
-                    std::cout << std::endl;
-                    continue;
-                }
-                
             } catch (const std::exception& ex) {
-                std::cout << "[" << (processedCount + skippedCount + quickSkipCount + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
+                std::cout << "[" << (processedCount + skippedCount + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
                 std::cout << "  Error: " << ex.what() << std::endl;
                 skippedCount++;
                 std::cout << std::endl;
@@ -1429,9 +1309,6 @@ public:
         std::cout << "Total files: " << files.size() << std::endl;
         std::cout << "Processed: " << processedCount << std::endl;
         std::cout << "Skipped (filter): " << skippedCount << std::endl;
-        if (quickCheck) {
-            std::cout << "Quick-skipped (likely correct): " << quickSkipCount << std::endl;
-        }
         std::cout << "No change needed: " << noChangeCount << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount << std::endl;
@@ -1448,13 +1325,10 @@ public:
                       << filesPerSecond << " files/second" << std::endl;
         }
         
-        if (quickCheck && quickSkipCount > 0) {
-            std::cout << "Time saved by quick check: ~" << (quickSkipCount * 10) << "ms (estimated)" << std::endl;
-        }
     }
 
     // Batch processing with smart load balancing
-    static void ProcessDirectoryBatch(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, bool quickCheck = true, int numThreads = 0, size_t batchSize = 0) {
+    static void ProcessDirectoryBatch(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, int numThreads = 0, size_t batchSize = 0) {
         auto startTime = std::chrono::high_resolution_clock::now();
         
         fs::path dir(directoryPath);
@@ -1478,7 +1352,6 @@ public:
         std::cout << "Algorithm: " << algorithm << std::endl;
         std::cout << "Recursive: " << (recursive ? "Yes" : "No") << std::endl;
         std::cout << "Mode: " << (dryRun ? "Preview" : "Execute") << std::endl;
-        std::cout << "Quick check: " << (quickCheck ? "Enabled" : "Disabled") << std::endl;
         std::cout << "Threads: " << numThreads << std::endl;
         std::cout << "Batch size: " << batchSize << std::endl;
         std::cout << "I/O buffer: " << ioBufferKB << " KB, mmap chunk: " << mmapChunkMB << " MB" << std::endl;
@@ -1536,7 +1409,6 @@ public:
         std::atomic<int> successCount{0};
         std::atomic<int> skippedCount{0};
         std::atomic<int> noChangeCount{0};
-        std::atomic<int> quickSkipCount{0};
         std::atomic<size_t> currentBatch{0};
         
         // Thread-safe output mutex
@@ -1569,17 +1441,6 @@ public:
                             prelude << "  Extension: \"" << extension << "\"" << std::endl;
                             prelude << "  Status: Skipped (extension not in filter)" << std::endl << std::endl;
                             skippedCount++;
-                            {
-                                std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << prelude.str();
-                            }
-                            continue;
-                        }
-                        
-                        // Quick check optimization
-                        if (quickCheck && QuickHashCheck(file, algorithm)) {
-                            prelude << "  Status: Likely already correctly named (quick check passed)" << std::endl << std::endl;
-                            quickSkipCount++;
                             {
                                 std::lock_guard<std::mutex> lock(outputMutex);
                                 std::cout << prelude.str();
@@ -1656,9 +1517,6 @@ public:
         std::cout << "Total files: " << files.size() << std::endl;
         std::cout << "Processed: " << processedCount.load() << std::endl;
         std::cout << "Skipped (filter): " << skippedCount.load() << std::endl;
-        if (quickCheck) {
-            std::cout << "Quick-skipped (likely correct): " << quickSkipCount.load() << std::endl;
-        }
         std::cout << "No change needed: " << noChangeCount.load() << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount.load() << std::endl;
@@ -1672,10 +1530,6 @@ public:
             
             double filesPerSecond = (processedCount.load() * 1000.0) / totalDuration.count();
             std::cout << "Throughput: " << std::fixed << std::setprecision(2) << filesPerSecond << " files/second" << std::endl;
-        }
-        
-        if (quickCheck && quickSkipCount.load() > 0) {
-            std::cout << "Time saved by quick check: ~" << (quickSkipCount.load() * 10) << "ms (estimated)" << std::endl;
         }
         
         std::cout << "Performance: " << numThreads << " threads, " << batches.size() << " batches utilized" << std::endl;
@@ -1700,8 +1554,6 @@ void PrintUsage() {
     std::cout << "  -e, --execute           Execute renaming (default is preview mode)" << std::endl;
     std::cout << "  -x, --extensions <ext>  Only process files with specified extensions" << std::endl;
     std::cout << "                          (e.g., jpg,png,txt or .jpg,.png,.txt)" << std::endl;
-    std::cout << "  -q, --quick             Enable quick check for already-named files [default: on]" << std::endl;
-    std::cout << "  --no-quick              Disable quick check (force full hash calculation)" << std::endl;
     std::cout << "  -y, --yes               Auto-confirm without user interaction" << std::endl;
     std::cout << "  -t, --threads <n>       Number of processing threads [default: auto-detect]" << std::endl;
     std::cout << "  -b, --batch <n>         Batch size for processing [default: auto-calculate]" << std::endl;
@@ -1729,7 +1581,6 @@ void PrintUsage() {
     std::cout << "  file_renamer C:\\MyFiles -a SHA1 -r -e -t 16           # Execute SHA1 renaming with 16 threads, recursive" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -a SHA256 -e                  # Execute SHA256 renaming" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -a CRC32 -x txt               # Use CRC32 for txt files only" << std::endl;
-    std::cout << "  file_renamer C:\\MyFiles --no-quick -t 4               # Force full hash check with 4 threads" << std::endl;
     std::cout << "  file_renamer C:\\MyFiles -e -y                        # Execute renaming with auto-confirm" << std::endl;
 }
 
@@ -1766,7 +1617,6 @@ int main(int argc, char* argv[]) {
     bool recursive = false;
     bool dryRun = true;
     bool showHelp = false;
-    bool quickCheck = true; // Enable quick check by default
     bool autoConfirm = false; // Auto-confirm without user interaction
     int numThreads = 0; // Auto-detect by default
     size_t batchSize = 0; // Auto-calculate by default
@@ -1788,10 +1638,8 @@ int main(int argc, char* argv[]) {
             recursive = true;
         } else if (arg == "-e" || arg == "--execute") {
             dryRun = false;
-        } else if (arg == "-q" || arg == "--quick") {
-            quickCheck = true;
-        } else if (arg == "--no-quick") {
-            quickCheck = false;
+        } else if (arg == "-q" || arg == "--quick" || arg == "--no-quick") {
+            // Backward-compatible no-op: quick check has been removed.
         } else if (arg == "-y" || arg == "--yes") {
             autoConfirm = true;
         } else if (arg == "--single-thread") {
@@ -1922,15 +1770,15 @@ int main(int argc, char* argv[]) {
     switch (mode) {
         case SINGLE_THREAD:
             std::cout << "Using single-threaded processing mode." << std::endl;
-            FileRenamerCLI::ProcessDirectory(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck);
+            FileRenamerCLI::ProcessDirectory(directory, algorithm, recursive, dryRun, allowedExtensions);
             break;
         case MULTI_THREAD:
             std::cout << "Using multi-threaded processing mode." << std::endl;
-            FileRenamerCLI::ProcessDirectoryMultiThreaded(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads);
+            FileRenamerCLI::ProcessDirectoryMultiThreaded(directory, algorithm, recursive, dryRun, allowedExtensions, numThreads);
             break;
         case BATCH_MODE:
             std::cout << "Using batch processing mode." << std::endl;
-            FileRenamerCLI::ProcessDirectoryBatch(directory, algorithm, recursive, dryRun, allowedExtensions, quickCheck, numThreads, batchSize);
+            FileRenamerCLI::ProcessDirectoryBatch(directory, algorithm, recursive, dryRun, allowedExtensions, numThreads, batchSize);
             break;
     }
     

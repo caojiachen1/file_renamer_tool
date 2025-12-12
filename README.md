@@ -52,8 +52,6 @@ file_renamer.exe <directory> [options]
 - `-r, --recursive`: Scan subdirectories recursively
 - `-e, --execute`: Actually perform renaming (default is preview-only)
 - `-x, --extensions <ext>`: Only process files with given extensions, e.g. `jpg,png,txt` or `.jpg,.png,.txt`
-- `-q, --quick`: Enable quick check (skip files that already look correctly hash-named, default on)
-- `--no-quick`: Disable quick check and force full hash calculation for all files
 - `-y, --yes`: Auto-confirm without interactive prompts
 - `-t, --threads <n>`: Number of worker threads; default is auto-detected from CPU cores
 - `-b, --batch <n>`: Batch size (files per batch in batch mode); default is auto-calculated
@@ -81,8 +79,8 @@ file_renamer_cli.exe C:\MyFiles -a SHA256 -r -e
 # Execute renaming for txt files using 8 threads
 file_renamer_cli.exe C:\MyFiles -e -x txt -t 8
 
-# Auto-confirm execution with quick check
-file_renamer_cli.exe C:\MyFiles -e -y -q
+# Auto-confirm execution
+file_renamer_cli.exe C:\MyFiles -e -y
 ```
 
 ## How It Works

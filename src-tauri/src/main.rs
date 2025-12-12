@@ -225,7 +225,6 @@ struct RunPayload {
     extensions: Option<String>,
     threads: Option<String>,
     batch: Option<String>,
-    quick: Option<bool>,
     execute: Option<bool>,
     yes: Option<bool>,
     recursive: Option<bool>,
@@ -260,7 +259,6 @@ fn build_args(exe: &Path, p: &RunPayload) -> anyhow::Result<Vec<String>> {
 
     if p.recursive.unwrap_or(false) { args.push("-r".into()); }
     if p.execute.unwrap_or(false) { args.push("-e".into()); if p.yes.unwrap_or(false) { args.push("-y".into()); } }
-    if let Some(q) = p.quick { args.push(if q { "-q" } else { "--no-quick" }.into()); }
 
     if let Some(t) = &p.threads { if !t.trim().is_empty() { args.push("-t".into()); args.push(t.trim().into()); } }
     else if p.mode.clone().unwrap_or_else(|| "ultra-fast".into()).to_lowercase() == "ultra-fast" {

@@ -83,14 +83,6 @@ def build_args(payload: dict) -> List[str]:
         if bool(payload.get("yes")):
             args += ["-y"]
 
-    # Quick check
-    quick = payload.get("quick")
-    if quick is not None:
-        if bool(quick):
-            args += ["-q"]
-        else:
-            args += ["--no-quick"]
-
     # Threads & batch
     threads = payload.get("threads")
     if threads:
