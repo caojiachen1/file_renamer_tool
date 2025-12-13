@@ -92,10 +92,12 @@
           <div style="margin-right: 16px;">
             <label>缓冲KB</label>
             <input id="buffer_kb" type="number" min="1" placeholder="自动" />
+            <small class="hint">哈希计算的流式缓冲区大小（KB），用于文件读取优化，默认自动</small>
           </div>
           <div style="margin-right: 16px;">
             <label>mmap块MB</label>
             <input id="mmap_chunk_mb" type="number" min="1" placeholder="自动" />
+            <small class="hint">内存映射文件块大小（MB），用于大文件处理优化，默认自动</small>
           </div>
         </div>
       </details>
@@ -113,8 +115,6 @@
     </fieldset>
 
     <script>
-      // Tauri detection (requires tauri.conf.json build.withGlobalTauri=true)
-      const isTauri = typeof window !== 'undefined' && window.__TAURI__ && window.__TAURI__.invoke;
       const $ = (id) => document.getElementById(id);
       const out = $("output");
       const btnRun = $("run");
@@ -123,28 +123,21 @@
 
       const modeSelect = $("mode");
       const threadsInput = $("threads");
-      let unlistenOutput = null;
-      let unlistenExit = null;
 
 
       const btnBrowse = $("btnBrowse");
       btnBrowse.addEventListener('click', async (e) => {
         e.preventDefault();
         try {
-          if (isTauri) {
-            const sel = await window.__TAURI__.dialog.open({ directory: true, multiple: false });
-            if (sel) { $("directory").value = Array.isArray(sel) ? sel[0] : sel; }
-          } else {
-            const res = await fetch('/api/browse-folder');
-            const j = await res.json();
-            if (!res.ok) {
-              if (j && j.error === 'cancelled') return; // user cancelled dialog
-              alert('选择目录失败：' + (j.error || res.statusText));
-              return;
-            }
-            if (j.path) {
-              $("directory").value = j.path;
-            }
+          const res = await fetch('/api/browse-folder');
+          const j = await res.json();
+          if (!res.ok) {
+            if (j && j.error === 'cancelled') return; // user cancelled dialog
+            alert('选择目录失败：' + (j.error || res.statusText));
+            return;
+          }
+          if (j.path) {
+            $("directory").value = j.path;
           }
         } catch (err) {
           const msg = (err && err.message) ? err.message : (typeof err === 'string' ? err : JSON.stringify(err));
@@ -182,62 +175,36 @@
         out.textContent = '';
         btnRun.disabled = true; btnStop.disabled = false;
         try {
-          if (isTauri) {
-            // attach listeners once
-            if (!unlistenOutput) {
-              unlistenOutput = await window.__TAURI__.event.listen('cli-output', (e) => {
-                if (typeof e.payload === 'string') append(e.payload);
-              });
-            }
-            if (!unlistenExit) {
-              unlistenExit = await window.__TAURI__.event.listen('cli-exit', (_e) => {
-                btnRun.disabled = false; btnStop.disabled = true;
-              });
-            }
-            // Tauri invoke requires named arguments matching Rust command parameters
-            await window.__TAURI__.invoke('start_run', { payload });
+          const res = await fetch('/api/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          if (!res.ok) {
+            const j = await res.json().catch(() => ({}));
+            append('启动失败：' + (j.error || res.statusText) + '\n');
           } else {
-            const res = await fetch('/api/run', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            if (!res.ok) {
-              const j = await res.json().catch(() => ({}));
-              append('启动失败：' + (j.error || res.statusText) + '\n');
-            } else {
-              const reader = res.body.getReader();
-              const decoder = new TextDecoder('utf-8');
-              while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                append(decoder.decode(value));
-              }
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              append(decoder.decode(value));
             }
           }
         } catch (e) {
           const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : JSON.stringify(e));
           append('请求失败：' + msg + '\n');
         } finally {
-          if (!isTauri) { btnRun.disabled = false; btnStop.disabled = true; }
+          btnRun.disabled = false; btnStop.disabled = true;
         }
       });
 
       btnStop.addEventListener('click', async () => {
         btnStop.disabled = true;
         try {
-          if (isTauri) {
-            await window.__TAURI__.invoke('stop_run');
-          } else {
-            await fetch('/api/stop', { method: 'POST' });
-          }
+          await fetch('/api/stop', { method: 'POST' });
         } catch {}
-      });
-      
-      // Cleanup listeners when closing
-      window.addEventListener('beforeunload', () => {
-        try { if (unlistenOutput) { unlistenOutput(); unlistenOutput = null; } } catch {}
-        try { if (unlistenExit) { unlistenExit(); unlistenExit = null; } } catch {}
       });
     </script>
   </body>
