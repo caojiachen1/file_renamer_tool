@@ -5,48 +5,139 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>File Renamer Web UI</title>
     <style>
-      body { font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 16px; background: #0b0d10; color: #e6edf3; }
-      h1 { font-size: 20px; }
-      fieldset { border: 1px solid #2d333b; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
-      legend { color: #9da7b1; }
-      label { display: inline-block; margin: 6px 0 4px; }
-      input[type=text], input[type=number], select { width: 100%; padding: 8px; background: #0e1116; border: 1px solid #2d333b; color: #e6edf3; border-radius: 6px; }
+      body { 
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
+        margin: 0; 
+        padding: 12px; 
+        min-height: 100vh;
+        background: #0b0d10;
+        color: #e6edf3;
+        line-height: 1.6;
+      }
+      .container {
+        max-width: 1400px;
+        margin: 0 auto;
+      }
+      fieldset { 
+        border: 1px solid #30363d; 
+        padding: 16px; 
+        border-radius: 8px; 
+        margin-bottom: 0;
+        background: #161b22;
+      }
+      legend { 
+        color: #f78166; 
+        font-weight: 600;
+        font-size: 16px;
+        padding: 0 12px;
+        margin-bottom: 16px;
+        border-bottom: 2px solid #f78166;
+        padding-bottom: 8px;
+      }
+      label { 
+        display: block; 
+        margin: 12px 0 8px 0; 
+        font-weight: 500;
+        color: #c9d1d9;
+        font-size: 14px;
+      }
+      input[type=text], input[type=number], select { 
+        width: 100%; 
+        padding: 8px 12px; 
+        background: #0e1116; 
+        border: 1px solid #30363d; 
+        color: #e6edf3; 
+        border-radius: 6px;
+        font-size: 14px;
+      }
+      input[type=text]:focus, input[type=number]:focus, select:focus {
+        border-color: #58a6ff;
+        outline: none;
+      }
+      input[type=text]::placeholder, input[type=number]::placeholder {
+        color: #8b949e;
+      }
       input[type=checkbox] { 
-        width: 20px; 
-        height: 20px; 
+        width: 18px; 
+        height: 18px; 
         cursor: pointer; 
-        margin: 0 12px 0 0;
-        accent-color: #238636;
+        margin: 0 8px 0 0;
+        accent-color: #58a6ff;
         border-radius: 4px;
-        transition: all 0.2s ease;
       }
-      input[type=checkbox]:hover {
-        transform: scale(1.1);
-        box-shadow: 0 0 8px rgba(35, 134, 54, 0.3);
+      .main-layout {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 20px;
+        margin-top: 16px;
       }
-      input[type=checkbox]:focus {
-        outline: 2px solid #238636;
-        outline-offset: 2px;
+      @media (max-width: 1024px) {
+        .main-layout {
+          grid-template-columns: 1fr;
+          gap: 16px;
+        }
       }
-      label:hover {
-        background-color: rgba(35, 134, 54, 0.1);
+      .actions { 
+        display: flex; 
+        gap: 12px; 
+        margin-top: 24px;
+        justify-content: center;
       }
-      .row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-      .row4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-      .actions { display: flex; gap: 8px; margin-top: 8px; }
-      button { background: #238636; color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
-      button.secondary { background: #30363d; }
-      button.warn { background: #d29922; }
-      button:disabled { opacity: .6; cursor: not-allowed; }
-      pre { background: #0e1116; border: 1px solid #2d333b; padding: 12px; border-radius: 8px; height: 380px; overflow: auto; white-space: pre-wrap; }
-      small { color: #9da7b1; }
-      .hint { color: #9da7b1; font-size: 12px; }
+      button { 
+        background: #238636;
+        color: white; 
+        border: none; 
+        padding: 10px 20px; 
+        border-radius: 6px; 
+        cursor: pointer;
+        font-weight: 500;
+        font-size: 14px;
+      }
+      button:hover {
+        background: #2ea043;
+      }
+      button.secondary { 
+        background: #30363d; 
+      }
+      button.secondary:hover {
+        background: #484f58;
+      }
+      button.warn { 
+        background: #d29922; 
+      }
+      button.warn:hover {
+        background: #bb8009;
+      }
+      button:disabled { 
+        opacity: 0.6; 
+        cursor: not-allowed;
+      }
+      pre { 
+        background: #0e1116;
+        border: 1px solid #30363d;
+        padding: 16px; 
+        border-radius: 8px; 
+        height: 500px; 
+        overflow: auto; 
+        white-space: pre-wrap;
+        font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      summary {
+        cursor: pointer;
+        font-weight: 500;
+        color: #58a6ff;
+        padding: 8px 0;
+        margin-bottom: 12px;
+      }
     </style>
   </head>
   <body>
-    <h1>文件批量重命名 · Web 界面</h1>
-    <fieldset>
-      <legend>基本设置</legend>
+    <div class="container">
+      <div class="main-layout">
+        <fieldset>
+          <legend>基本设置</legend>
       <div class="row" style="row-gap:14px; column-gap:18px;">
         <div>
           <label>目录路径</label>
@@ -68,8 +159,8 @@
           </select>
         </div>
       </div>
-  <div class="row4" style="margin-top:12px;">
-        <div style="margin-right: 16px;">
+  <div class="row" style="margin-top:12px;">
+        <div>
           <label>模式</label>
           <select id="mode">
             <option value="multi-thread">Multi Thread (默认)</option>
@@ -77,17 +168,9 @@
             <option value="single-thread">Single Thread</option>
           </select>
         </div>
-        <div style="margin-right: 16px;">
+        <div style="margin-right: 24px;">
           <label>扩展名过滤（逗号分隔）</label>
           <input id="extensions" type="text" value="jpg,jpeg,png" placeholder="jpg,png,txt 或 .jpg,.png,.txt" />
-        </div>
-        <div style="margin-right: 16px;">
-          <label>线程数</label>
-          <input id="threads" type="number" min="1" placeholder="留空=自动" />
-        </div>
-        <div style="margin-right: 16px;">
-          <label>批大小</label>
-          <input id="batch" type="number" min="1" placeholder="留空=自动" />
         </div>
       </div>
 
@@ -108,7 +191,15 @@
 
   <details style="margin-top:12px;">
         <summary>高级参数（可选）</summary>
-  <div class="row3" style="margin-top:12px; gap:16px;">
+  <div class="row4" style="margin-top:12px; gap:16px;">
+          <div style="margin-right: 16px;">
+            <label>线程数</label>
+            <input id="threads" type="number" min="1" placeholder="留空=自动" />
+          </div>
+          <div style="margin-right: 16px;">
+            <label>批大小</label>
+            <input id="batch" type="number" min="1" placeholder="留空=自动" />
+          </div>
           <div style="margin-right: 16px;">
             <label>缓冲KB</label>
             <input id="buffer_kb" type="number" min="1" placeholder="自动" />
@@ -127,12 +218,13 @@
         <button id="stop" class="warn" disabled>停止</button>
         <button id="clear" class="secondary">清空输出</button>
       </div>
-    </fieldset>
+        </fieldset>
 
-    <fieldset>
-      <legend>输出</legend>
-      <pre id="output"></pre>
-    </fieldset>
+        <fieldset>
+          <legend>输出</legend>
+          <pre id="output"></pre>
+        </fieldset>
+      </div>
 
     <script>
       const $ = (id) => document.getElementById(id);
@@ -227,5 +319,6 @@
         } catch {}
       });
     </script>
+    </div>
   </body>
   </html>
