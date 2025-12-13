@@ -830,6 +830,42 @@ public:
         std::string error;
         bool needsRename;
     };
+    
+    // Structure to track failed rename operations (space-time tradeoff for better debugging)
+    struct FailedRenameInfo {
+        fs::path filePath;
+        std::string fileName;
+        std::string errorCode;
+        std::string errorMessage;
+        std::string suggestion;
+        size_t fileIndex;
+    };
+    
+    // Thread-safe container for collecting failed renames
+    struct FailedRenameCollector {
+        std::vector<FailedRenameInfo> failures;
+        std::mutex mutex;
+        
+        void add(const FailedRenameInfo& info) {
+            std::lock_guard<std::mutex> lock(mutex);
+            failures.push_back(info);
+        }
+        
+        void clear() {
+            std::lock_guard<std::mutex> lock(mutex);
+            failures.clear();
+        }
+        
+        std::vector<FailedRenameInfo> getAll() const {
+            std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+            return failures;
+        }
+        
+        size_t count() const {
+            std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+            return failures.size();
+        }
+    };
 
     static FileHashResult ProcessSingleFile(const fs::path& filePath, const std::string& algorithm) {
         FileHashResult result;
@@ -1166,6 +1202,9 @@ public:
         std::atomic<int> noChangeCount{0};
         std::atomic<int> currentIndex{0};
         
+        // Failed rename collector (space-time tradeoff for better error tracking)
+        FailedRenameCollector failedRenames;
+        
         // Output buffer system to prevent mixing
         struct OutputBuffer {
             std::string content;
@@ -1252,6 +1291,17 @@ public:
                         } else {
                             buffer << "  Status: Failed to rename" << std::endl;
                             buffer << std::endl;
+                            
+                            // Collect detailed error information
+                            const auto& errorInfo = GetLastRenameError();
+                            FailedRenameInfo failInfo;
+                            failInfo.filePath = file;
+                            failInfo.fileName = fileName;
+                            failInfo.errorCode = errorInfo.errorCode;
+                            failInfo.errorMessage = errorInfo.errorMessage;
+                            failInfo.suggestion = errorInfo.suggestion;
+                            failInfo.fileIndex = fileIndex + 1;
+                            failedRenames.add(failInfo);
                         }
                     } else {
                         buffer << "  Status: Preview only (will be renamed)" << std::endl;
@@ -1320,7 +1370,30 @@ public:
         std::cout << "No change needed: " << noChangeCount.load() << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount.load() << std::endl;
-            std::cout << "Failed: " << (processedCount.load() - successCount.load() - noChangeCount.load()) << std::endl;
+            int failedCount = processedCount.load() - successCount.load() - noChangeCount.load();
+            std::cout << "Failed: " << failedCount << std::endl;
+            
+            // Display detailed failed rename list
+            if (failedCount > 0 && failedRenames.count() > 0) {
+                std::cout << std::endl;
+                std::cout << "============================================" << std::endl;
+                std::cout << "FAILED RENAMES (" << failedRenames.count() << " files):" << std::endl;
+                std::cout << "============================================" << std::endl;
+                
+                auto failures = failedRenames.getAll();
+                for (const auto& fail : failures) {
+                    std::cout << std::endl;
+                    std::cout << "[" << fail.fileIndex << "] File: " << fail.fileName << std::endl;
+                    std::cout << "    Path: " << fail.filePath.u8string() << std::endl;
+                    std::cout << "    Error: " << fail.errorCode << std::endl;
+                    std::cout << "    Message: " << fail.errorMessage << std::endl;
+                    if (!fail.suggestion.empty()) {
+                        std::cout << "    Hint: " << fail.suggestion << std::endl;
+                    }
+                }
+                std::cout << std::endl;
+                std::cout << "============================================" << std::endl;
+            }
         }
         std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
         
@@ -1382,6 +1455,9 @@ public:
         int skippedCount = 0;
         int noChangeCount = 0;
         
+        // Failed rename collector
+        FailedRenameCollector failedRenames;
+        
         for (const auto& file : files) {
             try {
                 std::string fileName = file.filename().u8string();
@@ -1430,6 +1506,17 @@ public:
                     successCount++;
                 } else {
                     std::cout << "  Status: Failed to rename" << std::endl;
+                    
+                    // Collect detailed error information
+                    const auto& errorInfo = GetLastRenameError();
+                    FailedRenameInfo failInfo;
+                    failInfo.filePath = file;
+                    failInfo.fileName = file.filename().u8string();
+                    failInfo.errorCode = errorInfo.errorCode;
+                    failInfo.errorMessage = errorInfo.errorMessage;
+                    failInfo.suggestion = errorInfo.suggestion;
+                    failInfo.fileIndex = processedCount + skippedCount;
+                    failedRenames.add(failInfo);
                 }
             } else {
                 std::cout << "  Status: Preview only (will be renamed)" << std::endl;
@@ -1450,7 +1537,30 @@ public:
         std::cout << "No change needed: " << noChangeCount << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount << std::endl;
-            std::cout << "Failed: " << (processedCount - successCount - noChangeCount) << std::endl;
+            int failedCount = processedCount - successCount - noChangeCount;
+            std::cout << "Failed: " << failedCount << std::endl;
+            
+            // Display detailed failed rename list
+            if (failedCount > 0 && failedRenames.count() > 0) {
+                std::cout << std::endl;
+                std::cout << "===========================================" << std::endl;
+                std::cout << "FAILED RENAMES (" << failedRenames.count() << " files):" << std::endl;
+                std::cout << "===========================================" << std::endl;
+                
+                auto failures = failedRenames.getAll();
+                for (const auto& fail : failures) {
+                    std::cout << std::endl;
+                    std::cout << "[" << fail.fileIndex << "] File: " << fail.fileName << std::endl;
+                    std::cout << "    Path: " << fail.filePath.u8string() << std::endl;
+                    std::cout << "    Error: " << fail.errorCode << std::endl;
+                    std::cout << "    Message: " << fail.errorMessage << std::endl;
+                    if (!fail.suggestion.empty()) {
+                        std::cout << "    Hint: " << fail.suggestion << std::endl;
+                    }
+                }
+                std::cout << std::endl;
+                std::cout << "===========================================" << std::endl;
+            }
         }
         std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
         
@@ -1549,6 +1659,9 @@ public:
         std::atomic<int> noChangeCount{0};
         std::atomic<size_t> currentBatch{0};
         
+        // Failed rename collector
+        FailedRenameCollector failedRenames;
+        
         // Thread-safe output mutex
         std::mutex outputMutex;
         
@@ -1612,6 +1725,17 @@ public:
                                     successCount++;
                                 } else {
                                     out << "  Status: Failed to rename" << std::endl << std::endl;
+                                    
+                                    // Collect detailed error information
+                                    const auto& errorInfo = GetLastRenameError();
+                                    FailedRenameInfo failInfo;
+                                    failInfo.filePath = file;
+                                    failInfo.fileName = fileName;
+                                    failInfo.errorCode = errorInfo.errorCode;
+                                    failInfo.errorMessage = errorInfo.errorMessage;
+                                    failInfo.suggestion = errorInfo.suggestion;
+                                    failInfo.fileIndex = globalIndex + 1;
+                                    failedRenames.add(failInfo);
                                 }
                             } else {
                                 out << "  Status: Preview only (will be renamed)" << std::endl << std::endl;
@@ -1658,7 +1782,30 @@ public:
         std::cout << "No change needed: " << noChangeCount.load() << std::endl;
         if (!dryRun) {
             std::cout << "Successfully renamed: " << successCount.load() << std::endl;
-            std::cout << "Failed: " << (processedCount.load() - successCount.load() - noChangeCount.load()) << std::endl;
+            int failedCount = processedCount.load() - successCount.load() - noChangeCount.load();
+            std::cout << "Failed: " << failedCount << std::endl;
+            
+            // Display detailed failed rename list
+            if (failedCount > 0 && failedRenames.count() > 0) {
+                std::cout << std::endl;
+                std::cout << "============================================" << std::endl;
+                std::cout << "FAILED RENAMES (" << failedRenames.count() << " files):" << std::endl;
+                std::cout << "============================================" << std::endl;
+                
+                auto failures = failedRenames.getAll();
+                for (const auto& fail : failures) {
+                    std::cout << std::endl;
+                    std::cout << "[" << fail.fileIndex << "] File: " << fail.fileName << std::endl;
+                    std::cout << "    Path: " << fail.filePath.u8string() << std::endl;
+                    std::cout << "    Error: " << fail.errorCode << std::endl;
+                    std::cout << "    Message: " << fail.errorMessage << std::endl;
+                    if (!fail.suggestion.empty()) {
+                        std::cout << "    Hint: " << fail.suggestion << std::endl;
+                    }
+                }
+                std::cout << std::endl;
+                std::cout << "============================================" << std::endl;
+            }
         }
         std::cout << "Total execution time: " << totalDuration.count() << "ms" << std::endl;
         
