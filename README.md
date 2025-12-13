@@ -1,4 +1,4 @@
-# File Renamer Tool - CLI Edition
+# File Renamer Tool - CLI
 
 A command-line utility for batch renaming files using hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B). This tool helps organize files by renaming them with their hash values while preserving file extensions.
 
@@ -97,6 +97,52 @@ file_renamer_cli.exe C:\MyFiles -e -y
 - **Confirmation prompt**: Asks for confirmation before executing rename operations
 - **Duplicate detection**: Warns if target filename already exists
 - **Error handling**: Graceful error handling with detailed messages
+
+## Enhanced Error Reporting
+
+The tool provides comprehensive error reporting for failed rename operations, including detailed diagnostics and actionable solutions.
+
+### Error Types and Solutions
+
+The tool now provides specific guidance for common rename failures:
+
+- **FILE_EXISTS**: Target filename already exists
+- **FILE_READONLY**: Source file has read-only attribute (`attrib -r "file"`)
+- **SOURCE_ACCESS_ERROR**: Permission denied or file locked by another process
+- **RENAME_FAILED_5**: Access denied (check antivirus, close applications)
+- **RENAME_FAILED_32**: File locked by another process
+- **RENAME_FAILED_112**: Disk full (free up space)
+- **RENAME_FAILED_19**: Disk write-protected
+
+### Failed Rename Report Format
+
+When renames fail, the tool displays a detailed summary at the end of processing:
+
+```
+===========================================
+FAILED RENAMES (2 files):
+===========================================
+
+[15] File: document.pdf
+    Path: C:\Files\document.pdf
+    Error: FILE_READONLY
+    Message: Source file is read-only
+    Hint: Remove read-only attribute: attrib -r "C:\Files\document.pdf"
+
+[23] File: image.jpg
+    Path: C:\Files\image.jpg
+    Error: RENAME_FAILED_5
+    Message: Access is denied
+    Hint: Access denied. Check file permissions or if file is locked by another application
+```
+
+Each failed rename includes:
+- **File index**: Position in the processing queue
+- **File name**: Original filename
+- **Full path**: Complete file path for easy location
+- **Error code**: Categorized error type
+- **Error message**: Detailed description of the failure
+- **Hint**: Specific command or action to resolve the issue
 
 ## File Processing
 
