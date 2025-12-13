@@ -8,7 +8,7 @@
       body { 
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
         margin: 0; 
-        padding: 12px; 
+        padding: 0; 
         min-height: 100vh;
         background: #0b0d10;
         color: #e6edf3;
@@ -69,7 +69,6 @@
         display: grid;
         grid-template-columns: 1fr 1fr;
         gap: 20px;
-        margin-top: 16px;
       }
       @media (max-width: 1024px) {
         .main-layout {
@@ -80,7 +79,7 @@
       .actions { 
         display: flex; 
         gap: 12px; 
-        margin-top: 24px;
+        margin-top: 8px;
         justify-content: center;
       }
       button { 
@@ -159,7 +158,7 @@
           </select>
         </div>
       </div>
-  <div class="row" style="margin-top:12px;">
+  <div class="row">
         <div>
           <label>模式</label>
           <select id="mode">
@@ -174,7 +173,7 @@
         </div>
       </div>
 
-  <div class="row" style="margin-top:12px; gap:16px;">
+  <div class="row" style="gap:16px;">
         <div style="margin-right: 16px;">
           <label style="display: flex; align-items: center; margin: 6px 0; cursor: pointer; padding: 8px; border-radius: 6px; transition: background-color 0.2s ease;">
             <input id="execute" type="checkbox" />
@@ -189,9 +188,9 @@
         </div>
       </div>
 
-  <details style="margin-top:12px;">
+  <details>
         <summary>高级参数（可选）</summary>
-  <div class="row4" style="margin-top:12px; gap:16px;">
+  <div class="row4" style="gap:16px;">
           <div style="margin-right: 16px;">
             <label>线程数</label>
             <input id="threads" type="number" min="1" placeholder="留空=自动" />
@@ -213,7 +212,7 @@
         </div>
       </details>
 
-      <div class="actions" style="margin-top:12px;">
+      <div class="actions">
         <button id="run">运行</button>
         <button id="stop" class="warn" disabled>停止</button>
         <button id="clear" class="secondary">清空输出</button>
