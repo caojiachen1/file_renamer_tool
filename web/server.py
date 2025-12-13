@@ -53,10 +53,27 @@ def build_args(payload: dict) -> List[str]:
         raise ValueError("目录路径不能为空")
 
     p = Path(directory)
-    if not p.exists() or not p.is_dir():
-        raise ValueError("目录不存在或不是文件夹: %s" % directory)
+    
+    # Security: Resolve to absolute path and check for path traversal
+    try:
+        resolved = p.resolve(strict=True)
+    except (OSError, RuntimeError) as e:
+        raise ValueError(f"无法解析目录路径: {e}")
+    
+    # Security: Ensure the path exists and is a directory
+    if not resolved.exists():
+        raise ValueError("目录不存在: %s" % directory)
+    if not resolved.is_dir():
+        raise ValueError("路径不是文件夹: %s" % directory)
+    
+    # Security: Check for suspicious patterns (optional, but adds defense in depth)
+    dir_str = str(resolved)
+    suspicious_patterns = ['..', '\x00', '|', '>', '<', '&', ';', '$', '`']
+    for pattern in suspicious_patterns:
+        if pattern in directory:
+            raise ValueError(f"目录路径包含不允许的字符: {pattern}")
 
-    args: List[str] = [str(EXECUTABLE), str(p)]
+    args: List[str] = [str(EXECUTABLE), str(resolved)]
 
     # Algorithm
     algorithm = (payload.get("algorithm") or "MD5").upper()
@@ -213,18 +230,23 @@ def stream_process(proc: subprocess.Popen):
 @app.post("/api/run")
 def run_cli():
     global _current_proc
-    if _proc_lock.locked():
+    
+    # Security: Use try_acquire pattern to avoid race condition
+    # The previous check (_proc_lock.locked()) and actual locking were separate operations
+    acquired = _proc_lock.acquire(blocking=False)
+    if not acquired:
         return jsonify({"ok": False, "error": "已有任务在运行中，请先停止或等待完成。"}), 429
 
     payload = request.get_json(silent=True) or {}
     try:
         args = build_args(payload)
     except Exception as e:
+        _proc_lock.release()  # Release lock on validation error
         return jsonify({"ok": False, "error": str(e)}), 400
 
     def generate():
         global _current_proc
-        with _proc_lock:
+        try:
             try:
                 _current_proc = subprocess.Popen(
                     args,
@@ -246,6 +268,8 @@ def run_cli():
                     yield chunk
             finally:
                 _current_proc = None
+        finally:
+            _proc_lock.release()  # Always release lock when done
 
     return Response(generate(), mimetype="text/plain; charset=utf-8")
 

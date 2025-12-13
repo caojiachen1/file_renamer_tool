@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <queue>
 #include <functional>
+#include <unordered_set>
 
 #pragma comment(lib, "advapi32.lib")
 
@@ -130,29 +131,44 @@ private:
 
     
     // CPU-optimized hex conversion for better performance
+    // Pre-computed lookup table for byte-to-hex conversion (space-time tradeoff)
+    static const char* HEX_LUT;
+    static std::once_flag hex_lut_once;
+    static char HEX_LUT_DATA[512]; // 256 * 2 bytes for lookup
+    
+    static void InitHexLUT() {
+        for (int i = 0; i < 256; ++i) {
+            HEX_LUT_DATA[i * 2] = HEX_CHARS[i >> 4];
+            HEX_LUT_DATA[i * 2 + 1] = HEX_CHARS[i & 0x0F];
+        }
+    }
+    
     static std::string BytesToHexOptimized(const BYTE* data, DWORD length) {
+        // Thread-safe initialization of lookup table
+        std::call_once(hex_lut_once, InitHexLUT);
+        
         std::string result;
-        result.reserve(length * 2);
+        result.resize(length * 2); // Pre-allocate exact size for better performance
         
-        // Process multiple bytes at once when possible
-        const DWORD* data32 = reinterpret_cast<const DWORD*>(data);
-        DWORD fullWords = length / 4;
+        char* out = &result[0];
         
-        // Process 4 bytes at a time for better cache performance
-        for (DWORD i = 0; i < fullWords; i++) {
-            DWORD word = data32[i];
-            // Extract each byte and convert
-            for (int j = 0; j < 4; j++) {
-                BYTE b = (word >> (j * 8)) & 0xFF;
-                result += HEX_CHARS[b >> 4];
-                result += HEX_CHARS[b & 0x0F];
-            }
+        // Use lookup table for O(1) per-byte conversion
+        // Process 4 bytes at a time for better cache utilization
+        DWORD i = 0;
+        for (; i + 4 <= length; i += 4) {
+            // Unrolled loop for better instruction-level parallelism
+            const BYTE* ptr = data + i;
+            memcpy(out, HEX_LUT_DATA + ptr[0] * 2, 2);
+            memcpy(out + 2, HEX_LUT_DATA + ptr[1] * 2, 2);
+            memcpy(out + 4, HEX_LUT_DATA + ptr[2] * 2, 2);
+            memcpy(out + 6, HEX_LUT_DATA + ptr[3] * 2, 2);
+            out += 8;
         }
         
         // Handle remaining bytes
-        for (DWORD i = fullWords * 4; i < length; i++) {
-            result += HEX_CHARS[data[i] >> 4];
-            result += HEX_CHARS[data[i] & 0x0F];
+        for (; i < length; ++i) {
+            memcpy(out, HEX_LUT_DATA + data[i] * 2, 2);
+            out += 2;
         }
         
         return result;
@@ -361,7 +377,7 @@ public:
         }
         
         if (!CryptCreateHash(hProv, CALG_SHA_512, 0, 0, &hHash)) {
-            CryptDestroyHash(hHash);
+            // Note: Do not call CryptDestroyHash when hHash is 0 (creation failed)
             CryptReleaseContext(hProv, 0);
             return "";
         }
@@ -391,10 +407,10 @@ public:
         // CRC32 polynomial (IEEE 802.3)
         static const uint32_t CRC32_POLY = 0xEDB88320;
         static uint32_t crc_table[256];
-        static bool table_initialized = false;
+        static std::once_flag crc_once_flag;
         
-        // Initialize CRC table if not done already
-        if (!table_initialized) {
+        // Thread-safe CRC table initialization using std::call_once
+        std::call_once(crc_once_flag, [&]() {
             for (uint32_t i = 0; i < 256; i++) {
                 uint32_t crc = i;
                 for (int j = 0; j < 8; j++) {
@@ -406,8 +422,7 @@ public:
                 }
                 crc_table[i] = crc;
             }
-            table_initialized = true;
-        }
+        });
         
         uint32_t crc = 0xFFFFFFFF;
         for (BYTE byte : data) {
@@ -614,12 +629,15 @@ public:
             
             if (CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
                 // Process in chunks to avoid overwhelming the hash function
-                const DWORD CHUNK_SIZE = static_cast<DWORD>(mmapChunkMB * 1024ull * 1024ull); // configurable MB
-                const DWORD CHUNK_SIZE_SAFE = (CHUNK_SIZE == 0 ? (4 * 1024 * 1024) : CHUNK_SIZE);
-                DWORD totalSize = static_cast<DWORD>(fileSize.QuadPart);
+                // Use uint64_t to support files > 4GB properly
+                const uint64_t CHUNK_SIZE = static_cast<uint64_t>(mmapChunkMB) * 1024ull * 1024ull;
+                const uint64_t CHUNK_SIZE_SAFE = (CHUNK_SIZE == 0 ? (4ull * 1024ull * 1024ull) : CHUNK_SIZE);
+                uint64_t totalSize = static_cast<uint64_t>(fileSize.QuadPart);
                 
-                for (DWORD offset = 0; offset < totalSize; offset += CHUNK_SIZE_SAFE) {
-                    DWORD chunkSize = (CHUNK_SIZE_SAFE < totalSize - offset) ? CHUNK_SIZE_SAFE : (totalSize - offset);
+                for (uint64_t offset = 0; offset < totalSize; offset += CHUNK_SIZE_SAFE) {
+                    // Calculate chunk size, ensuring it fits in DWORD for CryptHashData
+                    uint64_t remaining = totalSize - offset;
+                    DWORD chunkSize = static_cast<DWORD>(std::min(CHUNK_SIZE_SAFE, remaining));
                     if (!CryptHashData(hHash, pData + offset, chunkSize, 0)) {
                         break;
                     }
@@ -896,17 +914,125 @@ public:
         return files;
     }
     
+    // Enhanced error message structure for detailed rename failure reporting
+    struct RenameErrorInfo {
+        std::string errorCode;
+        std::string errorMessage;
+        std::string suggestion;
+    };
+    
+    // Get thread-local error info cache (space-time tradeoff)
+    static RenameErrorInfo& GetLastRenameError() {
+        thread_local RenameErrorInfo lastRenameError;
+        return lastRenameError;
+    }
+    
+    static std::string GetWindowsErrorMessage(DWORD errorCode) {
+        LPVOID lpMsgBuf = nullptr;
+        FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL, errorCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPWSTR)&lpMsgBuf, 0, NULL);
+        
+        std::wstring wMsg;
+        if (lpMsgBuf) {
+            wMsg = (LPCWSTR)lpMsgBuf;
+            LocalFree(lpMsgBuf);
+            // Remove trailing newlines
+            while (!wMsg.empty() && (wMsg.back() == L'\n' || wMsg.back() == L'\r')) {
+                wMsg.pop_back();
+            }
+        }
+        
+        // Convert to UTF-8
+        if (wMsg.empty()) return "Unknown error";
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, wMsg.c_str(), (int)wMsg.size(), NULL, 0, NULL, NULL);
+        std::string result(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wMsg.c_str(), (int)wMsg.size(), &result[0], size_needed, NULL, NULL);
+        return result;
+    }
+    
     static bool RenameFile(const fs::path& oldPath, const fs::path& newPath) {
+        // Clear previous error
+        auto& lastRenameError = GetLastRenameError();
+        lastRenameError = {};
+        
         try {
+            // Check if target already exists
             if (fs::exists(newPath)) {
-                std::cout << "Warning: Target file already exists: " << newPath.u8string() << std::endl;
+                lastRenameError.errorCode = "FILE_EXISTS";
+                lastRenameError.errorMessage = "Target file already exists: " + newPath.u8string();
+                lastRenameError.suggestion = "Delete the existing file or use a different naming scheme";
+                std::cerr << "  [ERROR] " << lastRenameError.errorCode << ": " << lastRenameError.errorMessage << std::endl;
+                std::cerr << "  [HINT] " << lastRenameError.suggestion << std::endl;
                 return false;
             }
             
+            // Check source file accessibility
+            std::error_code ec;
+            auto status = fs::status(oldPath, ec);
+            if (ec) {
+                lastRenameError.errorCode = "SOURCE_ACCESS_ERROR";
+                lastRenameError.errorMessage = "Cannot access source file: " + ec.message();
+                lastRenameError.suggestion = "Check file permissions or if file is locked by another process";
+                std::cerr << "  [ERROR] " << lastRenameError.errorCode << ": " << lastRenameError.errorMessage << std::endl;
+                std::cerr << "  [HINT] " << lastRenameError.suggestion << std::endl;
+                return false;
+            }
+            
+            // Check if source is read-only (Windows specific)
+            DWORD attrs = GetFileAttributesW(oldPath.wstring().c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                lastRenameError.errorCode = "FILE_READONLY";
+                lastRenameError.errorMessage = "Source file is read-only";
+                lastRenameError.suggestion = "Remove read-only attribute: attrib -r \"" + oldPath.u8string() + "\"";
+                std::cerr << "  [ERROR] " << lastRenameError.errorCode << ": " << lastRenameError.errorMessage << std::endl;
+                std::cerr << "  [HINT] " << lastRenameError.suggestion << std::endl;
+                return false;
+            }
+            
+            // Attempt rename
             fs::rename(oldPath, newPath);
             return true;
+            
         } catch (const fs::filesystem_error& ex) {
-            std::cerr << "Error renaming file: " << ex.what() << std::endl;
+            // Parse the underlying error code for detailed diagnostics
+            std::error_code ec = ex.code();
+            DWORD winError = static_cast<DWORD>(ec.value());
+            
+            lastRenameError.errorCode = "RENAME_FAILED_" + std::to_string(winError);
+            lastRenameError.errorMessage = ex.what();
+            
+            // Provide specific suggestions based on common error codes
+            switch (winError) {
+                case ERROR_ACCESS_DENIED: // 5
+                    lastRenameError.suggestion = "Access denied. Check file permissions or if file is locked by another application (e.g., antivirus, editor)";
+                    break;
+                case ERROR_SHARING_VIOLATION: // 32
+                    lastRenameError.suggestion = "File is locked by another process. Close any applications using this file";
+                    break;
+                case ERROR_FILE_NOT_FOUND: // 2
+                    lastRenameError.suggestion = "Source file was moved or deleted during processing";
+                    break;
+                case ERROR_PATH_NOT_FOUND: // 3
+                    lastRenameError.suggestion = "Target directory does not exist or path is invalid";
+                    break;
+                case ERROR_INVALID_NAME: // 123
+                    lastRenameError.suggestion = "Invalid filename. Check for illegal characters in the hash output";
+                    break;
+                case ERROR_DISK_FULL: // 112
+                    lastRenameError.suggestion = "Disk is full. Free up disk space and retry";
+                    break;
+                case ERROR_WRITE_PROTECT: // 19
+                    lastRenameError.suggestion = "Disk is write-protected. Remove write protection";
+                    break;
+                default:
+                    lastRenameError.suggestion = "Windows error " + std::to_string(winError) + ": " + GetWindowsErrorMessage(winError);
+                    break;
+            }
+            
+            std::cerr << "  [ERROR] " << lastRenameError.errorCode << ": " << lastRenameError.errorMessage << std::endl;
+            std::cerr << "  [HINT] " << lastRenameError.suggestion << std::endl;
             return false;
         }
     }
@@ -938,35 +1064,47 @@ public:
         return false;
     }
 
-    // Optimized version for scanning - avoids string operations where possible
+    // Thread-local extension cache for O(1) lookup (space-time tradeoff)
+    // This avoids repeated string transformations during high-throughput processing
+    struct ExtensionCache {
+        std::unordered_set<std::string> normalizedExtensions;
+        bool initialized = false;
+        
+        void initialize(const std::vector<std::string>& allowedExtensions) {
+            if (initialized) return;
+            normalizedExtensions.reserve(allowedExtensions.size());
+            for (const auto& ext : allowedExtensions) {
+                std::string normalizedExt = ext;
+                // Convert to lowercase
+                std::transform(normalizedExt.begin(), normalizedExt.end(), normalizedExt.begin(), ::tolower);
+                // Ensure dot prefix
+                if (!normalizedExt.empty() && normalizedExt[0] != '.') {
+                    normalizedExt = "." + normalizedExt;
+                }
+                normalizedExtensions.insert(normalizedExt);
+            }
+            initialized = true;
+        }
+        
+        bool contains(const std::string& ext) const {
+            std::string lowerExt = ext;
+            std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::tolower);
+            return normalizedExtensions.find(lowerExt) != normalizedExtensions.end();
+        }
+    };
+
+    // Optimized version for scanning - uses O(1) hash set lookup instead of O(n) linear search
     static bool ShouldProcessFileQuick(const fs::path& filePath, const std::vector<std::string>& allowedExtensions) {
         if (allowedExtensions.empty()) {
             return true;
         }
         
-        const std::string& fileExt = filePath.extension().u8string();
+        // Thread-local cache to avoid contention (initialized on first use)
+        thread_local ExtensionCache extensionCache;
+        extensionCache.initialize(allowedExtensions);
         
-        // Quick case-insensitive comparison without creating new strings
-        for (const auto& ext : allowedExtensions) {
-            if (fileExt.size() == ext.size() || 
-                (ext[0] != '.' && fileExt.size() == ext.size() + 1)) {
-                
-                bool match = true;
-                size_t start = (ext[0] == '.') ? 0 : 1; // Skip dot if needed
-                
-                for (size_t i = start; i < fileExt.size() && match; ++i) {
-                    char fileChar = std::tolower(fileExt[i]);
-                    char extChar = std::tolower(ext[i - start]);
-                    if (fileChar != extChar) {
-                        match = false;
-                    }
-                }
-                
-                if (match) return true;
-            }
-        }
-        
-        return false;
+        const std::string fileExt = filePath.extension().u8string();
+        return extensionCache.contains(fileExt);
     }
     
     // Multi-threaded processing with buffered output to prevent output mixing
@@ -1538,6 +1676,11 @@ public:
 
 // Static member definition
 const char FileRenamerCLI::HEX_CHARS[16] = {'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f'};
+
+// Static member definitions for hex lookup table (space-time tradeoff optimization)
+const char* FileRenamerCLI::HEX_LUT = nullptr;
+std::once_flag FileRenamerCLI::hex_lut_once;
+char FileRenamerCLI::HEX_LUT_DATA[512];
 
 // Static member definitions - CPU only (GPU support removed)
 size_t FileRenamerCLI::ioBufferKB = 1024;     // 1MB default streaming buffer
