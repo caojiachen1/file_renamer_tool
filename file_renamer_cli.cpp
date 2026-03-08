@@ -120,6 +120,13 @@ public:
 
 class FileRenamerCLI {
 private:
+    struct ScannedFile {
+        fs::path path;
+        uintmax_t size = 0;
+    };
+
+    using ExtensionSet = std::unordered_set<std::string>;
+
     // Optimized hex conversion using lookup table with SIMD-friendly approach
     static const char HEX_CHARS[16];
     
@@ -141,6 +148,116 @@ private:
             HEX_LUT_DATA[i * 2] = HEX_CHARS[i >> 4];
             HEX_LUT_DATA[i * 2 + 1] = HEX_CHARS[i & 0x0F];
         }
+    }
+
+    struct ThreadLocalCryptoProviders {
+        HCRYPTPROV rsaFull = 0;
+        HCRYPTPROV rsaAes = 0;
+
+        HCRYPTPROV Acquire(bool useEnhanced) {
+            HCRYPTPROV& provider = useEnhanced ? rsaAes : rsaFull;
+            if (provider != 0) {
+                return provider;
+            }
+
+            if (useEnhanced) {
+                if (!CryptAcquireContext(&provider, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+                    provider = 0;
+                }
+            } else {
+                if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+                    provider = 0;
+                }
+            }
+
+            return provider;
+        }
+
+        ~ThreadLocalCryptoProviders() {
+            if (rsaFull != 0) {
+                CryptReleaseContext(rsaFull, 0);
+            }
+            if (rsaAes != 0) {
+                CryptReleaseContext(rsaAes, 0);
+            }
+        }
+    };
+
+    static HCRYPTPROV AcquireThreadLocalProvider(const std::string& algorithm) {
+        const bool useEnhanced = (algorithm == "SHA256" || algorithm == "SHA512");
+        thread_local ThreadLocalCryptoProviders providers;
+
+        HCRYPTPROV provider = providers.Acquire(useEnhanced);
+        if (provider == 0 && useEnhanced) {
+            provider = providers.Acquire(false);
+        }
+        return provider;
+    }
+
+    static std::string NormalizeExtension(std::string extension) {
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        if (!extension.empty() && extension[0] != '.') {
+            extension.insert(extension.begin(), '.');
+        }
+
+        return extension;
+    }
+
+    static ExtensionSet BuildExtensionSet(const std::vector<std::string>& allowedExtensions) {
+        ExtensionSet normalizedExtensions;
+        normalizedExtensions.reserve(allowedExtensions.size());
+
+        for (const auto& extension : allowedExtensions) {
+            normalizedExtensions.insert(NormalizeExtension(extension));
+        }
+
+        return normalizedExtensions;
+    }
+
+    static bool ShouldProcessFile(const fs::path& filePath, const ExtensionSet& allowedExtensions) {
+        if (allowedExtensions.empty()) {
+            return true;
+        }
+
+        return allowedExtensions.find(NormalizeExtension(filePath.extension().u8string())) != allowedExtensions.end();
+    }
+
+    static std::string CalculateCryptoHash(const BYTE* data, DWORD length, const std::string& algorithm) {
+        auto hashInfo = GetHashInfo(algorithm);
+        const DWORD hashSize = hashInfo.first;
+        const ALG_ID algId = hashInfo.second;
+        if (hashSize == 0 || algId == 0) {
+            return "";
+        }
+
+        HCRYPTPROV hProv = AcquireThreadLocalProvider(algorithm);
+        if (hProv == 0) {
+            return "";
+        }
+
+        HCRYPTHASH hHash = 0;
+        if (!CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
+            return "";
+        }
+
+        if (length > 0 && !CryptHashData(hHash, data, length, 0)) {
+            CryptDestroyHash(hHash);
+            return "";
+        }
+
+        std::vector<BYTE> rgbHash(hashSize);
+        DWORD cbHash = hashSize;
+        if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash.data(), &cbHash, 0)) {
+            CryptDestroyHash(hHash);
+            return "";
+        }
+
+        std::string result = BytesToHex(rgbHash.data(), cbHash);
+        CryptDestroyHash(hHash);
+        return result;
     }
     
     static std::string BytesToHexOptimized(const BYTE* data, DWORD length) {
@@ -252,154 +369,21 @@ public:
     // GPU processing check removed - CPU only
     
     static std::string CalculateMD5(const std::vector<BYTE>& data) {
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        BYTE rgbHash[16];
-        DWORD cbHash = 16;
-        
-        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-            return "";
-        }
-        
-        if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptHashData(hHash, data.data(), (DWORD)data.size(), 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        std::string result = BytesToHex(rgbHash, cbHash);
-        
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        
-        return result;
+        return CalculateCryptoHash(data.data(), static_cast<DWORD>(data.size()), "MD5");
     }
     
     static std::string CalculateSHA1(const std::vector<BYTE>& data) {
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        BYTE rgbHash[20];
-        DWORD cbHash = 20;
-        
-        if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-            return "";
-        }
-        
-        if (!CryptCreateHash(hProv, CALG_SHA1, 0, 0, &hHash)) {
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptHashData(hHash, data.data(), (DWORD)data.size(), 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        std::string result = BytesToHex(rgbHash, cbHash);
-        
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        
-        return result;
+        return CalculateCryptoHash(data.data(), static_cast<DWORD>(data.size()), "SHA1");
     }
     
     // SHA256 implementation using Windows CNG API
     static std::string CalculateSHA256(const std::vector<BYTE>& data) {
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        BYTE rgbHash[32];
-        DWORD cbHash = 32;
-        
-        // Try to use enhanced provider for SHA256
-        if (!CryptAcquireContext(&hProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-            // Fallback to RSA_FULL provider
-            if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                return "";
-            }
-        }
-        
-        if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptHashData(hHash, data.data(), (DWORD)data.size(), 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        std::string result = BytesToHex(rgbHash, cbHash);
-        
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        
-        return result;
+        return CalculateCryptoHash(data.data(), static_cast<DWORD>(data.size()), "SHA256");
     }
     
     // SHA512 implementation using Windows CNG API
     static std::string CalculateSHA512(const std::vector<BYTE>& data) {
-        HCRYPTPROV hProv = 0;
-        HCRYPTHASH hHash = 0;
-        BYTE rgbHash[64];
-        DWORD cbHash = 64;
-        
-        // Try to use enhanced provider for SHA512
-        if (!CryptAcquireContext(&hProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-            // Fallback to RSA_FULL provider
-            if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                return "";
-            }
-        }
-        
-        if (!CryptCreateHash(hProv, CALG_SHA_512, 0, 0, &hHash)) {
-            // Note: Do not call CryptDestroyHash when hHash is 0 (creation failed)
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptHashData(hHash, data.data(), (DWORD)data.size(), 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash, &cbHash, 0)) {
-            CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
-            return "";
-        }
-        
-        std::string result = BytesToHex(rgbHash, cbHash);
-        
-        CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
-        
-        return result;
+        return CalculateCryptoHash(data.data(), static_cast<DWORD>(data.size()), "SHA512");
     }
     
     // CRC32 implementation (IEEE 802.3)
@@ -603,28 +587,15 @@ public:
                 return CalculateFileHashStreaming(filePath, algorithm);
             }
             
-            HCRYPTPROV hProv = 0;
             HCRYPTHASH hHash = 0;
             std::string result;
-            
-            // Try enhanced provider first for newer algorithms
-            bool useEnhanced = (algorithm == "SHA256" || algorithm == "SHA512");
-            if (useEnhanced) {
-                if (!CryptAcquireContext(&hProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-                    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                        UnmapViewOfFile(pData);
-                        CloseHandle(hMapping);
-                        CloseHandle(hFile);
-                        return CalculateFileHashStreaming(filePath, algorithm);
-                    }
-                }
-            } else {
-                if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                    UnmapViewOfFile(pData);
-                    CloseHandle(hMapping);
-                    CloseHandle(hFile);
-                    return CalculateFileHashStreaming(filePath, algorithm);
-                }
+
+            HCRYPTPROV hProv = AcquireThreadLocalProvider(algorithm);
+            if (hProv == 0) {
+                UnmapViewOfFile(pData);
+                CloseHandle(hMapping);
+                CloseHandle(hFile);
+                return CalculateFileHashStreaming(filePath, algorithm);
             }
             
             if (CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
@@ -652,7 +623,6 @@ public:
                 
                 CryptDestroyHash(hHash);
             }
-            CryptReleaseContext(hProv, 0);
             
             UnmapViewOfFile(pData);
             CloseHandle(hMapping);
@@ -746,25 +716,14 @@ public:
         ALG_ID algId = hashInfo.second;
         if (hashSize == 0) { CloseHandle(hFile); return ""; }
 
-        HCRYPTPROV hProv = 0;
-        bool useEnhanced = (algorithm == "SHA256" || algorithm == "SHA512");
-        if (useEnhanced) {
-            if (!CryptAcquireContext(&hProv, NULL, MS_ENH_RSA_AES_PROV, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-                if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                    CloseHandle(hFile);
-                    return "";
-                }
-            }
-        } else {
-            if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
-                CloseHandle(hFile);
-                return "";
-            }
+        HCRYPTPROV hProv = AcquireThreadLocalProvider(algorithm);
+        if (hProv == 0) {
+            CloseHandle(hFile);
+            return "";
         }
 
         HCRYPTHASH hHash = 0;
         if (!CryptCreateHash(hProv, algId, 0, 0, &hHash)) {
-            CryptReleaseContext(hProv, 0);
             CloseHandle(hFile);
             return "";
         }
@@ -781,20 +740,17 @@ public:
 
         if (!ok) {
             CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
             return "";
         }
 
         std::vector<BYTE> rgbHash(hashSize); DWORD cbHash = hashSize;
         if (!CryptGetHashParam(hHash, HP_HASHVAL, rgbHash.data(), &cbHash, 0)) {
             CryptDestroyHash(hHash);
-            CryptReleaseContext(hProv, 0);
             return "";
         }
 
         std::string result = BytesToHex(rgbHash.data(), cbHash);
         CryptDestroyHash(hHash);
-        CryptReleaseContext(hProv, 0);
         return result;
     }
     
@@ -896,8 +852,8 @@ public:
         return result;
     }
     
-    static std::vector<fs::path> ScanDirectory(const fs::path& directory, bool recursive = false, const std::vector<std::string>& allowedExtensions = {}) {
-        std::vector<fs::path> files;
+    static std::vector<ScannedFile> ScanDirectory(const fs::path& directory, bool recursive = false, const ExtensionSet& allowedExtensions = {}) {
+        std::vector<ScannedFile> files;
         files.reserve(5000); // Increased reservation for better performance
         
         try {
@@ -908,8 +864,10 @@ public:
                     try {
                         if (entry.is_regular_file()) {
                             // Pre-filter by extension during scanning for better performance
-                            if (allowedExtensions.empty() || ShouldProcessFileQuick(entry.path(), allowedExtensions)) {
-                                files.push_back(entry.path());
+                            if (ShouldProcessFile(entry.path(), allowedExtensions)) {
+                                std::error_code sizeEc;
+                                auto fileSize = entry.file_size(sizeEc);
+                                files.push_back({entry.path(), sizeEc ? 0 : fileSize});
                             }
                         }
                     } catch (const fs::filesystem_error& ex) {
@@ -924,8 +882,10 @@ public:
                     try {
                         if (entry.is_regular_file()) {
                             // Pre-filter by extension during scanning for better performance
-                            if (allowedExtensions.empty() || ShouldProcessFileQuick(entry.path(), allowedExtensions)) {
-                                files.push_back(entry.path());
+                            if (ShouldProcessFile(entry.path(), allowedExtensions)) {
+                                std::error_code sizeEc;
+                                auto fileSize = entry.file_size(sizeEc);
+                                files.push_back({entry.path(), sizeEc ? 0 : fileSize});
                             }
                         }
                     } catch (const fs::filesystem_error& ex) {
@@ -939,12 +899,8 @@ public:
         }
         
         // Sort files by size for better processing order (small files first)
-        std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
-            std::error_code ec1, ec2;
-            auto sizeA = fs::file_size(a, ec1);
-            auto sizeB = fs::file_size(b, ec2);
-            if (ec1 || ec2) return false;
-            return sizeA < sizeB;
+        std::sort(files.begin(), files.end(), [](const ScannedFile& a, const ScannedFile& b) {
+            return a.size < b.size;
         });
         
         return files;
@@ -1073,76 +1029,6 @@ public:
         }
     }
     
-    static bool ShouldProcessFile(const fs::path& filePath, const std::vector<std::string>& allowedExtensions) {
-        if (allowedExtensions.empty()) {
-            return true; // Process all files if no filter specified
-        }
-        
-        std::string fileExt = filePath.extension().u8string();
-        
-        // Convert to lowercase for case-insensitive comparison
-        std::transform(fileExt.begin(), fileExt.end(), fileExt.begin(), ::tolower);
-        
-        for (const auto& ext : allowedExtensions) {
-            std::string lowerExt = ext;
-            std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::tolower);
-            
-            // Add dot if not present
-            if (!lowerExt.empty() && lowerExt[0] != '.') {
-                lowerExt = "." + lowerExt;
-            }
-            
-            if (fileExt == lowerExt) {
-                return true;
-            }
-        }
-        
-        return false;
-    }
-
-    // Thread-local extension cache for O(1) lookup (space-time tradeoff)
-    // This avoids repeated string transformations during high-throughput processing
-    struct ExtensionCache {
-        std::unordered_set<std::string> normalizedExtensions;
-        bool initialized = false;
-        
-        void initialize(const std::vector<std::string>& allowedExtensions) {
-            if (initialized) return;
-            normalizedExtensions.reserve(allowedExtensions.size());
-            for (const auto& ext : allowedExtensions) {
-                std::string normalizedExt = ext;
-                // Convert to lowercase
-                std::transform(normalizedExt.begin(), normalizedExt.end(), normalizedExt.begin(), ::tolower);
-                // Ensure dot prefix
-                if (!normalizedExt.empty() && normalizedExt[0] != '.') {
-                    normalizedExt = "." + normalizedExt;
-                }
-                normalizedExtensions.insert(normalizedExt);
-            }
-            initialized = true;
-        }
-        
-        bool contains(const std::string& ext) const {
-            std::string lowerExt = ext;
-            std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::tolower);
-            return normalizedExtensions.find(lowerExt) != normalizedExtensions.end();
-        }
-    };
-
-    // Optimized version for scanning - uses O(1) hash set lookup instead of O(n) linear search
-    static bool ShouldProcessFileQuick(const fs::path& filePath, const std::vector<std::string>& allowedExtensions) {
-        if (allowedExtensions.empty()) {
-            return true;
-        }
-        
-        // Thread-local cache to avoid contention (initialized on first use)
-        thread_local ExtensionCache extensionCache;
-        extensionCache.initialize(allowedExtensions);
-        
-        const std::string fileExt = filePath.extension().u8string();
-        return extensionCache.contains(fileExt);
-    }
-    
     // Multi-threaded processing with buffered output to prevent output mixing
     static void ProcessDirectoryMultiThreaded(const std::string& directoryPath, const std::string& algorithm = "MD5", bool recursive = false, bool dryRun = true, const std::vector<std::string>& allowedExtensions = {}, int numThreads = 0) {
         auto startTime = std::chrono::high_resolution_clock::now();
@@ -1184,7 +1070,8 @@ public:
         std::cout << "===========================================" << std::endl;
         
         auto scanStartTime = std::chrono::high_resolution_clock::now();
-        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto normalizedExtensions = BuildExtensionSet(allowedExtensions);
+        auto files = ScanDirectory(dir, recursive, normalizedExtensions);
         auto scanEndTime = std::chrono::high_resolution_clock::now();
         
         auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
@@ -1215,7 +1102,8 @@ public:
         };
         
         std::vector<OutputBuffer> outputBuffers(files.size());
-        std::mutex outputMutex;
+        std::mutex outputStateMutex;
+        std::condition_variable outputReadyCondition;
         std::atomic<size_t> nextOutputIndex{0};
         
         // Progress tracking
@@ -1233,7 +1121,7 @@ public:
                     break;
                 }
                 
-                const auto& file = files[fileIndex];
+                const auto& file = files[fileIndex].path;
                 std::stringstream buffer; // Local buffer for this file's output
                 
                 try {
@@ -1241,21 +1129,6 @@ public:
                     
                     // Build output in local buffer first
                     buffer << "[" << (fileIndex + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
-                    
-                    // Check if file extension matches filter
-                    if (!ShouldProcessFile(file, allowedExtensions)) {
-                        std::string extension = file.extension().u8string();
-                        buffer << "  Extension: \"" << extension << "\"" << std::endl;
-                        buffer << "  Status: Skipped (extension not in filter)" << std::endl;
-                        buffer << std::endl;
-                        skippedCount++;
-                        
-                        // Store in output buffer
-                        outputBuffers[fileIndex].content = buffer.str();
-                        outputBuffers[fileIndex].fileIndex = fileIndex;
-                        outputBuffers[fileIndex].ready = true;
-                        continue;
-                    }
                     
                     processedCount++;
                     
@@ -1265,9 +1138,13 @@ public:
                         buffer << std::endl;
                         
                         // Store in output buffer
-                        outputBuffers[fileIndex].content = buffer.str();
-                        outputBuffers[fileIndex].fileIndex = fileIndex;
-                        outputBuffers[fileIndex].ready = true;
+                        {
+                            std::lock_guard<std::mutex> lock(outputStateMutex);
+                            outputBuffers[fileIndex].content = buffer.str();
+                            outputBuffers[fileIndex].fileIndex = fileIndex;
+                            outputBuffers[fileIndex].ready = true;
+                        }
+                        outputReadyCondition.notify_one();
                         continue;
                     }
                     
@@ -1316,9 +1193,13 @@ public:
                 }
                 
                 // Store completed output in buffer
-                outputBuffers[fileIndex].content = buffer.str();
-                outputBuffers[fileIndex].fileIndex = fileIndex;
-                outputBuffers[fileIndex].ready = true;
+                {
+                    std::lock_guard<std::mutex> lock(outputStateMutex);
+                    outputBuffers[fileIndex].content = buffer.str();
+                    outputBuffers[fileIndex].fileIndex = fileIndex;
+                    outputBuffers[fileIndex].ready = true;
+                }
+                outputReadyCondition.notify_one();
                 
                 // Update progress
                 progress.fetch_add(1);
@@ -1327,17 +1208,18 @@ public:
         
         // Output thread to maintain proper order
         auto outputWorker = [&]() {
+            std::unique_lock<std::mutex> lock(outputStateMutex);
             while (nextOutputIndex.load() < files.size()) {
-                size_t currentOutput = nextOutputIndex.load();
-                if (currentOutput < files.size() && outputBuffers[currentOutput].ready) {
-                    {
-                        std::lock_guard<std::mutex> lock(outputMutex);
-                        std::cout << outputBuffers[currentOutput].content << std::flush;
-                    }
+                outputReadyCondition.wait(lock, [&]() {
+                    return nextOutputIndex.load() >= files.size() || outputBuffers[nextOutputIndex.load()].ready;
+                });
+
+                while (nextOutputIndex.load() < files.size() && outputBuffers[nextOutputIndex.load()].ready) {
+                    std::string content = std::move(outputBuffers[nextOutputIndex.load()].content);
+                    lock.unlock();
+                    std::cout << content;
+                    lock.lock();
                     nextOutputIndex.fetch_add(1);
-                } else {
-                    // Wait a bit before checking again
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
             }
         };
@@ -1444,7 +1326,8 @@ public:
         std::cout << "===========================================" << std::endl;
         
         auto scanStartTime = std::chrono::high_resolution_clock::now();
-        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto normalizedExtensions = BuildExtensionSet(allowedExtensions);
+        auto files = ScanDirectory(dir, recursive, normalizedExtensions);
         auto scanEndTime = std::chrono::high_resolution_clock::now();
         
         auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
@@ -1458,21 +1341,11 @@ public:
         // Failed rename collector
         FailedRenameCollector failedRenames;
         
-        for (const auto& file : files) {
+        for (const auto& scannedFile : files) {
+            const auto& file = scannedFile.path;
             try {
                 std::string fileName = file.filename().u8string();
                 std::cout << "[" << (processedCount + skippedCount + 1) << "/" << files.size() << "] Processing: \"" << fileName << "\"" << std::endl;
-                
-                // Check if file extension matches filter
-                if (!ShouldProcessFile(file, allowedExtensions)) {
-                    std::string extension = file.extension().u8string();
-                    std::cout << "  Extension: \"" << extension << "\"" << std::endl;
-                    std::cout << "  Status: Skipped (extension not in filter)" << std::endl;
-                    skippedCount++;
-                    std::cout << std::endl;
-                    continue;
-                }
-                
             } catch (const std::exception& ex) {
                 std::cout << "[" << (processedCount + skippedCount + 1) << "/" << files.size() << "] Processing: <Error reading filename>" << std::endl;
                 std::cout << "  Error: " << ex.what() << std::endl;
@@ -1621,7 +1494,8 @@ public:
         std::cout << "===========================================" << std::endl;
         
         auto scanStartTime = std::chrono::high_resolution_clock::now();
-        auto files = ScanDirectory(dir, recursive, allowedExtensions);
+        auto normalizedExtensions = BuildExtensionSet(allowedExtensions);
+        auto files = ScanDirectory(dir, recursive, normalizedExtensions);
         auto scanEndTime = std::chrono::high_resolution_clock::now();
         
         auto scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(scanEndTime - scanStartTime);
@@ -1633,18 +1507,14 @@ public:
         }
         
         // Sort files by size for better load balancing (mix of small and large files)
-        std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
-            std::error_code ec1, ec2;
-            auto sizeA = fs::file_size(a, ec1);
-            auto sizeB = fs::file_size(b, ec2);
-            if (ec1 || ec2) return false;
-            return sizeA > sizeB; // Large files first for better scheduling
+        std::sort(files.begin(), files.end(), [](const ScannedFile& a, const ScannedFile& b) {
+            return a.size > b.size; // Large files first for better scheduling
         });
         
         // Create batches
-        std::vector<std::vector<fs::path>> batches;
+        std::vector<std::vector<ScannedFile>> batches;
         for (size_t i = 0; i < files.size(); i += batchSize) {
-            std::vector<fs::path> batch;
+            std::vector<ScannedFile> batch;
             size_t end = std::min(i + batchSize, files.size());
             batch.assign(files.begin() + i, files.begin() + end);
             batches.push_back(std::move(batch));
@@ -1678,26 +1548,13 @@ public:
                 
                 // Process all files in this batch
                 for (size_t fileIndex = 0; fileIndex < batch.size(); fileIndex++) {
-                    const auto& file = batch[fileIndex];
+                    const auto& file = batch[fileIndex].path;
                     
                     try {
                         std::string fileName = file.filename().u8string();
                         size_t globalIndex = batchIndex * batchSize + fileIndex;
                         std::stringstream prelude;
                         prelude << "[" << (globalIndex + 1) << "/" << files.size() << "] Batch " << (batchIndex + 1) << "/" << batches.size() << " Processing: \"" << fileName << "\"" << std::endl;
-                        
-                        // Check if file extension matches filter
-                        if (!ShouldProcessFile(file, allowedExtensions)) {
-                            std::string extension = file.extension().u8string();
-                            prelude << "  Extension: \"" << extension << "\"" << std::endl;
-                            prelude << "  Status: Skipped (extension not in filter)" << std::endl << std::endl;
-                            skippedCount++;
-                            {
-                                std::lock_guard<std::mutex> lock(outputMutex);
-                                std::cout << prelude.str();
-                            }
-                            continue;
-                        }
                         
                         {
                             std::string hash = CalculateFileHashOptimized(file, algorithm);

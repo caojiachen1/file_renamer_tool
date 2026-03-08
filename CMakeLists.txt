@@ -94,7 +94,11 @@ target_compile_definitions(file_renamer_cli PRIVATE
 # Disable optimization and enable debug info for Debug (C++ only)
 target_compile_options(file_renamer_cli PRIVATE 
     $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:/Od /Zi>
-    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/O2>
+    $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/O2 /Oi /Ot /GL>
+)
+
+target_link_options(file_renamer_cli PRIVATE
+    $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
 )
 
 # =============================================================================
