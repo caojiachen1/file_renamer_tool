@@ -1,17 +1,18 @@
 {
-  "name": "file-renamer-tool",
-  "private": true,
-  "version": "0.1.0",
-  "description": "File Renamer Tool - Desktop App",
-  "scripts": {
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build"
-  },
   "dependencies": {
     "@tauri-apps/api": "^2"
   },
+  "description": "File Renamer Tool - Desktop App",
   "devDependencies": {
     "@tauri-apps/cli": "^2"
-  }
+  },
+  "name": "file-renamer-tool",
+  "private": true,
+  "scripts": {
+    "build": "tauri build",
+    "dev": "tauri dev",
+    "msix": "scripts\\msix.bat",
+    "tauri": "tauri"
+  },
+  "version": "0.1.0"
 }

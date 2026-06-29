@@ -69,3 +69,7 @@ build/
 .*/
 
 *test*/
+*.msix
+
+# Development certificate
+devcert.pfx
