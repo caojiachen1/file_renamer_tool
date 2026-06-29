@@ -1,9 +1,11 @@
 # Node
 node_modules/
-target/
 
-# Python venv (if any)
-.venv/
+# Rust / Tauri
+src-tauri/target/
+
+# Tauri build output
+dist/
 
 # Build outputs
 build/**/*.ilk
