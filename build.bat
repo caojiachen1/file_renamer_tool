@@ -13,18 +13,20 @@ if errorlevel 1 (
 
 where cl.exe >nul 2>&1
 if errorlevel 1 (
-    echo Error: Visual Studio 2022 not found in PATH
-    echo Please run this from a Visual Studio 2022 Developer Command Prompt
+    echo Error: Visual Studio 2026 not found in PATH
+    echo Please run this from a Visual Studio 2026 Developer Command Prompt
     pause
     exit /b 1
 )
 
-if not exist "build" mkdir build
+if exist "build" rmdir /s /q build
+
+mkdir build
 
 cd build
 
 echo Configuring project...
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -G "Visual Studio 18 2026" -A x64
 if errorlevel 1 (
     echo Failed to configure project
     cd ..

@@ -14,8 +14,13 @@ if %errorlevel% neq 0 (
 
 REM --- Build if exe missing ---
 if not exist .\src-tauri\target\release\file-renamer-tool.exe (
-    echo Executable not found. Running build...
+    echo Tauri executable not found. Running build...
     npm run tauri build
+)
+
+if not exist .\file_renamer.exe (
+    echo CLI executable not found. Running build...
+    call build.bat
 )
 
 REM --- Generate and install dev cert if missing ---
@@ -31,6 +36,7 @@ mkdir msix
 
 REM --- Copy files ---
 copy .\src-tauri\target\release\file-renamer-tool.exe .\msix
+copy .\file_renamer.exe .\msix
 copy .\appxmanifest.xml .\msix
 xcopy /E /I .\icons .\msix\icons
 copy /Y .\src-tauri\icons\icon.ico .\msix\icons\icon.ico 2>nul
