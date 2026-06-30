@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::theme::colors;
 
+// Lock-free ring buffer between reader thread and UI
 struct RingBuffer { data: Vec<u8>, head: usize, len: usize, cap: usize }
 impl RingBuffer {
     fn new(cap: usize) -> Self { Self { data: vec![0; cap], head: 0, len: 0, cap } }
@@ -18,14 +19,25 @@ impl RingBuffer {
         if self.len + n > self.cap { self.head = (self.head + (self.len + n - self.cap)) % self.cap; self.len = self.cap; }
         else { self.len += n; }
     }
-    fn read_latest(&self, max: usize) -> String {
+    fn drain_all(&mut self) -> String {
         if self.len == 0 { return String::new(); }
-        let take = self.len.min(max); let st = (self.head + self.len - take) % self.cap;
-        let mut buf = Vec::with_capacity(take);
-        if st + take <= self.cap { buf.extend_from_slice(&self.data[st..st+take]); }
-        else { let f = self.cap - st; buf.extend_from_slice(&self.data[st..]); buf.extend_from_slice(&self.data[..take-f]); }
-        if let Some(p) = buf.iter().rposition(|&b| b == b'\n') { buf.truncate(p+1); }
-        String::from_utf8_lossy(&buf).to_string()
+        let st = self.head;
+        let take = self.len;
+        self.len = 0;
+        self.head = 0;
+        // Build string directly without intermediate Vec
+        let mut result = String::with_capacity(take);
+        if st + take <= self.cap {
+            // Safety: we know the data is valid UTF-8 from push()
+            unsafe { result.as_mut_vec().extend_from_slice(&self.data[st..st+take]); }
+        } else {
+            let f = self.cap - st;
+            unsafe {
+                result.as_mut_vec().extend_from_slice(&self.data[st..]);
+                result.as_mut_vec().extend_from_slice(&self.data[..take-f]);
+            }
+        }
+        result
     }
     fn clear(&mut self) { self.head = 0; self.len = 0; }
 }
@@ -42,19 +54,21 @@ pub struct App {
     directory: String, algorithm_index: usize, mode_index: usize,
     extensions: String, threads: String, batch_size: String,
     recursive: bool, execute: bool, is_running: bool,
-    ring: RingBuffer, output_text: String, rx: Option<mpsc::Receiver<String>>,
+    ring: RingBuffer, output_text: String, output_cap: usize,
+    rx: Option<mpsc::Receiver<String>>,
 }
 
 const ALG: &[&str] = &["MD5","SHA1","SHA256","SHA512","CRC32","BLAKE2B"];
 const MOD: &[(&str,&str)] = &[("multi-thread","Multi Thread (默认)"),("batch-mode","Batch Mode"),("single-thread","Single Thread")];
 const RING_CAP: usize = 4*1024*1024;
-const DISPLAY: usize = 128*1024;
+const OUTPUT_CAP: usize = 32*1024;  // Keep last 32KB in display
 
 pub fn new() -> (App, Task<Message>) {
     (App { directory: String::new(), algorithm_index: 0, mode_index: 0,
         extensions: "jpg,jpeg,png".into(), threads: String::new(), batch_size: String::new(),
         recursive: false, execute: false, is_running: false,
-        ring: RingBuffer::new(RING_CAP), output_text: String::new(), rx: None,
+        ring: RingBuffer::new(RING_CAP), output_text: String::new(), output_cap: OUTPUT_CAP,
+        rx: None,
     }, Task::none())
 }
 
@@ -80,7 +94,8 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             if app.is_running || app.directory.is_empty() { return Task::none(); }
             app.is_running = true;
             app.ring.clear();
-            app.ring.push("Starting...\n");
+            app.output_text.clear();
+            app.output_text.push_str("Starting...\n");
 
             let exe = find_cli_exe();
             let mut args: Vec<String> = Vec::new();
@@ -88,11 +103,7 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             let a = ALG[app.algorithm_index];
             if a != "MD5" { args.push("-a".into()); args.push(a.into()); }
             let m = MOD[app.mode_index].0;
-            match m {
-                "single-thread" => args.push("--single-thread".into()),
-                "batch-mode" => args.push("--batch-mode".into()),
-                _ => {}
-            }
+            match m { "single-thread"=>args.push("--single-thread".into()), "batch-mode"=>args.push("--batch-mode".into()), _=>{} }
             if app.recursive { args.push("-r".into()); }
             if app.execute { args.push("-e".into()); args.push("-y".into()); }
             if !app.extensions.is_empty() { args.push("-x".into()); args.push(app.extensions.clone()); }
@@ -101,10 +112,9 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
 
             let (tx, rx) = mpsc::channel();
             app.rx = Some(rx);
-
             std::thread::spawn(move || {
                 match run_cli_process(&exe, &args, &tx) {
-                    Ok(()) => { let _ = tx.send("[DONE]\n".into()); }
+                    Ok(()) => {}
                     Err(e) => { let _ = tx.send(format!("[ERROR] {}\n", e)); }
                 }
             });
@@ -112,6 +122,7 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
         Message::Stop => app.is_running = false,
         Message::ClearOutput => { app.ring.clear(); app.output_text.clear(); }
         Message::Tick => {
+            // Bulk drain ring buffer — one allocation per frame
             if let Some(rx) = &app.rx {
                 loop {
                     match rx.try_recv() {
@@ -121,7 +132,20 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
                     }
                 }
             }
-            app.output_text = app.ring.read_latest(DISPLAY);
+            // Append new data directly to output_text (no intermediate copy)
+            let new_data = app.ring.drain_all();
+            if !new_data.is_empty() {
+                app.output_text.push_str(&new_data);
+                // Truncate to keep only last OUTPUT_CAP bytes
+                if app.output_text.len() > app.output_cap {
+                    let excess = app.output_text.len() - app.output_cap;
+                    app.output_text.drain(..excess);
+                    // Re-align to line boundary
+                    if let Some(pos) = app.output_text.find('\n') {
+                        app.output_text.drain(..pos + 1);
+                    }
+                }
+            }
         }
     }
     Task::none()
@@ -132,28 +156,23 @@ fn run_cli_process(exe: &str, args: &[String], tx: &mpsc::Sender<String>) -> Res
     use std::os::windows::process::CommandExt;
 
     let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(0x08000000);
 
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("Failed to spawn '{}': {}", exe, e))?;
-
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn '{}': {}", exe, e))?;
     let stdout = child.stdout.take().ok_or("No stdout")?;
     let stderr = child.stderr.take().ok_or("No stderr")?;
 
     let tx1 = tx.clone();
     let t1 = std::thread::spawn(move || {
-        let mut r = std::io::BufReader::new(stdout);
-        let mut buf = [0u8; 8192];
+        let mut r = std::io::BufReader::with_capacity(32768, stdout);
+        let mut buf = [0u8; 32768];
         loop { match r.read(&mut buf) { Ok(0)|Err(_)=>break, Ok(n)=>{ let _ = tx1.send(String::from_utf8_lossy(&buf[..n]).to_string()); } } }
     });
 
     let tx2 = tx.clone();
     let t2 = std::thread::spawn(move || {
-        let mut r = std::io::BufReader::new(stderr);
-        let mut buf = [0u8; 8192];
+        let mut r = std::io::BufReader::with_capacity(32768, stderr);
+        let mut buf = [0u8; 32768];
         loop { match r.read(&mut buf) { Ok(0)|Err(_)=>break, Ok(n)=>{ let _ = tx2.send(String::from_utf8_lossy(&buf[..n]).to_string()); } } }
     });
 
@@ -178,7 +197,7 @@ fn find_cli_exe() -> String {
 }
 
 pub fn subscription(app: &App) -> Subscription<Message> {
-    if app.is_running { time::every(Duration::from_millis(16)).map(|_|Message::Tick) }
+    if app.is_running { time::every(Duration::from_millis(32)).map(|_|Message::Tick) } // 30fps
     else { Subscription::none() }
 }
 
@@ -201,7 +220,7 @@ fn view_settings(app: &App) -> Element<'_, Message> {
     let mb: Vec<Element<'_,Message>> = MOD.iter().enumerate()
         .map(|(i,(_,l))| button(*l).on_press(Message::ModeChanged(i)).style(if i==app.mode_index{btn_acc}else{btn_tog}).height(32).into()).collect();
 
-    let adv = column![lbl("高级参数（可选）"),row![
+    let adv = column![lbl("高级参数"),row![
         column![lbl("线程数"),text_input("留空=自动",&app.threads).on_input(Message::ThreadsChanged)].spacing(4).width(Length::Fill),
         column![lbl("批大小"),text_input("留空=自动",&app.batch_size).on_input(Message::BatchSizeChanged)].spacing(4).width(Length::Fill),
     ].spacing(12)].spacing(4);
@@ -212,14 +231,14 @@ fn view_settings(app: &App) -> Element<'_, Message> {
         column![lbl("目录路径"),dir_row,hint("请输入本机磁盘中的文件夹路径，或使用\"选择...\"打开文件夹对话框")].spacing(4),
         column![lbl("算法"),row(ab).spacing(4)].spacing(4),
         column![lbl("模式"),row(mb).spacing(4)].spacing(4),
-        column![lbl("扩展名过滤（逗号分隔）"),text_input("jpg,png,txt 或 .jpg,.png,.txt",&app.extensions).on_input(Message::ExtensionsChanged)].spacing(4),
-        row![row![checkbox::Checkbox::new(app.execute).on_toggle(Message::ToggleExecute),lbl("执行重命名（默认预览）")].spacing(6).align_y(iced::Alignment::Center),
+        column![lbl("扩展名过滤"),text_input("jpg,png,txt",&app.extensions).on_input(Message::ExtensionsChanged)].spacing(4),
+        row![row![checkbox::Checkbox::new(app.execute).on_toggle(Message::ToggleExecute),lbl("执行重命名")].spacing(6).align_y(iced::Alignment::Center),
              row![checkbox::Checkbox::new(app.recursive).on_toggle(Message::ToggleRecursive),lbl("包含子目录")].spacing(6).align_y(iced::Alignment::Center)].spacing(20),
         adv,
-        row![run,button("停止").on_press(Message::Stop).style(btn_dan).height(36),button("清空输出").on_press(Message::ClearOutput).style(btn_sec).height(36)].spacing(12),
+        row![run,button("停止").on_press(Message::Stop).style(btn_dan).height(36),button("清空").on_press(Message::ClearOutput).style(btn_sec).height(36)].spacing(12),
     ].spacing(16).padding(24);
 
-    column![row![text("基本设置").size(16).color(colors::ACCENT)],container(card).width(Length::Fill).style(fcard)].spacing(8).width(Length::Fill).into()
+    column![row![text("设置").size(16).color(colors::ACCENT)],container(card).width(Length::Fill).style(fcard)].spacing(8).width(Length::Fill).into()
 }
 
 fn view_output(app: &App) -> Element<'_, Message> {

@@ -384,6 +384,22 @@ jobs:
         Set-Location ..
         Write-Host "✅ Rust build completed!"
         Get-ChildItem rust\target\release\*.exe
+
+    - name: Build iced GUI version
+      shell: pwsh
+      run: |
+        Write-Host "Building iced GUI version..."
+        Set-Location gui
+        
+        cargo build --release
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "iced GUI build failed!"
+          exit 1
+        }
+        
+        Set-Location ..
+        Write-Host "✅ iced GUI build completed!"
+        Get-ChildItem gui\target\release\*.exe
         
     - name: Verify build artifacts
       shell: pwsh
@@ -439,6 +455,16 @@ jobs:
           Write-Host "Rust executable prepared: $rust_name"
         } else {
           Write-Host "Warning: Rust executable not found at $rust_exe"
+        }
+        
+        # Copy iced GUI executable
+        $gui_exe = "gui\target\release\FileRenamer.exe"
+        if (Test-Path $gui_exe) {
+          $gui_name = "file_renamer_cli_$($version)_windows_x64_gui.exe"
+          Copy-Item $gui_exe "release-assets\$gui_name"
+          Write-Host "iced GUI executable prepared: $gui_name"
+        } else {
+          Write-Host "Warning: iced GUI executable not found at $gui_exe"
         }
         
         Write-Host "Release file preparation complete ($performance_note):"
