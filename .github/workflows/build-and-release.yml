@@ -334,6 +334,8 @@ jobs:
         echo Starting project build...
         setlocal enabledelayedexpansion
         
+        cd cpp
+        
         echo 🔧 Building CPU version ^(standard mode^)...
         echo Configuring CMake ^(CPU mode^)...
         cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=OFF
@@ -354,14 +356,16 @@ jobs:
           exit /b !BUILD_EXIT_CODE!
         )
         
+        cd ..
+        
         echo Copying executable to root directory...
-        if exist "build\Release\file_renamer_cli.exe" (
-          copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
+        if exist "cpp\build\Release\file_renamer_cli.exe" (
+          copy "cpp\build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul 2>&1
           echo ✅ CPU version build completed!
         ) else (
           echo ❌ Build artifacts not found!
           echo Searching for possible build artifact locations...
-          dir /s build\*.exe 2>nul
+          dir /s cpp\build\*.exe 2>nul
           exit /b 1
         )
         
@@ -386,9 +390,9 @@ jobs:
       run: |
         Write-Host "Verifying build artifacts..."
         
-        $release_exe = "build\Release\file_renamer_cli.exe"
+        $release_exe = "cpp\build\Release\file_renamer_cli.exe"
         $root_exe = "file_renamer.exe"
-        $debug_exe = "build\Debug\file_renamer_cli.exe"
+        $debug_exe = "cpp\build\Debug\file_renamer_cli.exe"
         
         if (Test-Path $release_exe) {
           Write-Host "✓ Found Release version: $release_exe"
@@ -425,7 +429,7 @@ jobs:
         # Copy the main executable file
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
-        Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
+        Copy-Item "cpp\build\Release\file_renamer_cli.exe" "release-assets\$release_name"
         
         # Copy Rust executable
         $rust_exe = "rust\target\release\file_renamer.exe"
