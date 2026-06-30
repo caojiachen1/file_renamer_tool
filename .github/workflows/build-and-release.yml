@@ -247,9 +247,9 @@ jobs:
       shell: pwsh
       run: |
         $version_number = "${{ steps.version.outputs.version_number }}"
-        $cmake_content = Get-Content CMakeLists.txt -Raw
+        $cmake_content = Get-Content cpp/CMakeLists.txt -Raw
         $cmake_content = $cmake_content -replace 'project\(FileRenamerTool VERSION \d+\.\d+\.\d+', "project(FileRenamerTool VERSION $version_number"
-        Set-Content CMakeLists.txt $cmake_content
+        Set-Content cpp/CMakeLists.txt $cmake_content
         Write-Host "Updated version in CMakeLists.txt to: $version_number"
         
     - name: Create and push tag (for manual trigger and auto release)
