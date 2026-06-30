@@ -37,6 +37,9 @@ jobs:
     - name: Setup CMake
       uses: lukka/get-cmake@latest
       
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      
     - name: Get version from tag or input
       id: version
       shell: pwsh
@@ -362,6 +365,22 @@ jobs:
           exit /b 1
         )
         
+    - name: Build Rust version
+      shell: pwsh
+      run: |
+        Write-Host "Building Rust version..."
+        Set-Location rust
+        
+        cargo build --release
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Rust build failed!"
+          exit 1
+        }
+        
+        Set-Location ..
+        Write-Host "✅ Rust build completed!"
+        Get-ChildItem rust\target\release\*.exe
+        
     - name: Verify build artifacts
       shell: pwsh
       run: |
@@ -396,9 +415,9 @@ jobs:
       id: prepare_release_assets
       shell: pwsh
       run: |
-        Write-Host "Preparing release files (CPU version)..."
-        $build_description = "cpu"
-        $performance_note = "Standard CPU version"
+        Write-Host "Preparing release files..."
+        $build_description = "cpp"
+        $performance_note = "C++ version"
         
         # Create release directory
         New-Item -ItemType Directory -Force -Path "release-assets"
@@ -407,6 +426,16 @@ jobs:
         $version = "${{ steps.version.outputs.version }}"
         $release_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
         Copy-Item "build\Release\file_renamer_cli.exe" "release-assets\$release_name"
+        
+        # Copy Rust executable
+        $rust_exe = "rust\target\release\file_renamer.exe"
+        if (Test-Path $rust_exe) {
+          $rust_name = "file_renamer_cli_$($version)_windows_x64_rust.exe"
+          Copy-Item $rust_exe "release-assets\$rust_name"
+          Write-Host "Rust executable prepared: $rust_name"
+        } else {
+          Write-Host "Warning: Rust executable not found at $rust_exe"
+        }
         
         Write-Host "Release file preparation complete ($performance_note):"
         Get-ChildItem "release-assets" | ForEach-Object {
@@ -523,19 +552,69 @@ jobs:
           exit 1
         }
         
-    - name: Upload Release Asset - Main Executable
+    - name: Upload Release Assets
       shell: pwsh
       run: |
-        $version = "${{ steps.version.outputs.version }}"
-        $build_description = "${{ steps.prepare_release_assets.outputs.build_description }}"
-        $asset_name = "file_renamer_cli_$($version)_windows_x64_$build_description.exe"
-        $asset_path = "release-assets/$asset_name"
         $upload_url = "${{ steps.create_release.outputs.upload_url }}"
+        $release_id = "${{ steps.create_release.outputs.id }}"
+        $assets_url = "https://api.github.com/repos/${{ github.repository }}/releases/$release_id/assets"
         
-        # Check if file exists
-        if (-not (Test-Path $asset_path)) {
-          Write-Error "File to upload not found: $asset_path"
-          exit 1
+        # Get existing assets to check for duplicates
+        $existing_assets = @()
+        try {
+          $existing_assets = Invoke-RestMethod -Uri $assets_url -Headers @{
+            'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            'Accept' = 'application/vnd.github.v3+json'
+          }
+        } catch {
+          Write-Host "Could not fetch existing assets, continuing..."
+        }
+        
+        # Upload each file in release-assets directory
+        Get-ChildItem "release-assets" | ForEach-Object {
+          $asset_name = $_.Name
+          $asset_path = $_.FullName
+          
+          Write-Host ""
+          Write-Host "Uploading: $asset_name"
+          
+          # Check if file with same name already exists in Release
+          $existing_asset = $existing_assets | Where-Object { $_.name -eq $asset_name }
+          
+          if ($existing_asset) {
+            Write-Host "File $asset_name already exists in Release, deleting old version"
+            $delete_url = "https://api.github.com/repos/${{ github.repository }}/releases/assets/$($existing_asset.id)"
+            Invoke-RestMethod -Uri $delete_url -Method DELETE -Headers @{
+              'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+            }
+            Write-Host "Old version deleted"
+          }
+          
+          try {
+            $headers = @{
+              'Authorization' = 'token ${{ secrets.GITHUB_TOKEN }}'
+              'Content-Type' = 'application/octet-stream'
+            }
+            
+            # Prepare upload URL
+            $upload_url_clean = $upload_url -replace '\{\?name,label\}', "?name=$asset_name"
+            Write-Host "Upload URL: $upload_url_clean"
+            
+            # Read file and upload
+            $file_bytes = [System.IO.File]::ReadAllBytes($asset_path)
+            Write-Host "File size: $([math]::Round($file_bytes.Length/1KB, 2)) KB"
+            
+            $response = Invoke-RestMethod -Uri $upload_url_clean -Method POST -Headers $headers -Body $file_bytes
+            
+            Write-Host "✅ File upload successful: $asset_name"
+            Write-Host "  Download URL: $($response.browser_download_url)"
+            Write-Host "  File size: $([math]::Round($response.size/1KB, 2)) KB"
+            
+          } catch {
+            Write-Error "File upload failed for $asset_name : $($_.Exception.Message)"
+            Write-Error "Status code: $($_.Exception.Response.StatusCode)"
+            exit 1
+          }
         }
         
         try {

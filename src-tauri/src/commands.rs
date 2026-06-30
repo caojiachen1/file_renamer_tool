@@ -5,9 +5,27 @@ use tauri::Emitter;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
-#[derive(Default)]
 pub struct AppState {
     current_child: Arc<Mutex<Option<Child>>>,
+    current_pid: Arc<Mutex<Option<u32>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            current_child: Arc::new(Mutex::new(None)),
+            current_pid: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Force-kill a process tree on Windows using taskkill /F /T
+fn force_kill_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn find_executable() -> Option<PathBuf> {
@@ -44,13 +62,26 @@ fn find_executable() -> Option<PathBuf> {
         }
     }
 
-    let build_rel = [
+    let rust_build_rel = [
+        "rust/target/release/file_renamer.exe",
+        "rust/target/debug/file_renamer.exe",
+    ];
+    for base in &bases {
+        for rel in &rust_build_rel {
+            let p = base.join(rel);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    let cpp_build_rel = [
         "build/Release/file_renamer_cli.exe",
         "build/Debug/file_renamer_cli_d.exe",
         "build/Release/file_renamer.exe",
     ];
     for base in &bases {
-        for rel in &build_rel {
+        for rel in &cpp_build_rel {
             let p = base.join(rel);
             if p.exists() {
                 return Some(p);
@@ -156,14 +187,18 @@ pub async fn run_cli(
     app.emit("cli-output", serde_json::json!({"text": format!("运行命令: {}\n\n", cmd_display)}))
         .map_err(|e| e.to_string())?;
 
+    // Kill any existing process tree by PID
     {
-        let old_child = {
-            let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+        let old_pid = {
+            let mut guard = state.current_pid.lock().map_err(|e| e.to_string())?;
             guard.take()
         };
-        if let Some(mut child) = old_child {
-            let _ = child.kill().await;
+        if let Some(pid) = old_pid {
+            force_kill_tree(pid);
         }
+        // Also drop any lingering Child handle
+        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+        *guard = None;
     }
 
     let mut child = Command::new(&args[0])
@@ -174,40 +209,73 @@ pub async fn run_cli(
         .spawn()
         .map_err(|e| format!("启动失败: {}", e))?;
 
-    let stdout = child.stdout.take().ok_or("无法获取进程输出")?;
+    let pid = child.id().unwrap_or(0);
 
+    let stdout = child.stdout.take().ok_or("无法获取进程输出")?;
+    let stderr = child.stderr.take().ok_or("无法获取进程输出")?;
+
+    // Store both Child (for reading) and PID (for killing)
     {
         let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
         *guard = Some(child);
+        let mut pid_guard = state.current_pid.lock().map_err(|e| e.to_string())?;
+        *pid_guard = Some(pid);
     }
 
-    let app_clone = app.clone();
-    let state_clone = state.inner().current_child.clone();
+    let app_stderr = app.clone();
+    let app_stdout = app.clone();
+    let app_final = app.clone();
+    let state_child = state.inner().current_child.clone();
+    let state_pid = state.inner().current_pid.clone();
 
     tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let _ = app_clone.emit(
-                "cli-output",
-                serde_json::json!({"text": format!("{}\n", line)}),
-            );
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stderr.emit(
+                    "cli-output",
+                    serde_json::json!({"text": format!("{}\n", line)}),
+                );
+            }
+        });
+
+        {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app_stdout.emit(
+                    "cli-output",
+                    serde_json::json!({"text": format!("{}\n", line)}),
+                );
+            }
         }
 
-        let child = {
-            let mut guard = state_clone.lock().unwrap();
-            guard.take()
-        };
-        let exit_code = if let Some(child) = child {
-            match child.wait_with_output().await {
-                Ok(status) => status.status.code().unwrap_or(-1),
-                Err(_) => -1,
+        let _ = stderr_task.await;
+
+        // Wait for the child to exit
+        let exit_code = {
+            let child_opt = {
+                let mut guard = state_child.lock().unwrap();
+                guard.take()
+            };
+            if let Some(mut child) = child_opt {
+                match child.wait().await {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                }
+            } else {
+                -1
             }
-        } else {
-            -1
         };
 
-        let _ = app_clone.emit(
+        // Clear PID
+        {
+            let mut guard = state_pid.lock().unwrap();
+            *guard = None;
+        }
+
+        let _ = app_final.emit(
             "cli-output",
             serde_json::json!({"text": format!("\n[exit-code] {}\n", exit_code), "done": true}),
         );
@@ -218,16 +286,22 @@ pub async fn run_cli(
 
 #[tauri::command]
 pub async fn stop_cli(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let child = {
-        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+    // Kill by PID first — guaranteed to kill entire process tree
+    let pid = {
+        let mut guard = state.current_pid.lock().map_err(|e| e.to_string())?;
         guard.take()
     };
-    if let Some(mut child) = child {
-        child.kill().await.map_err(|e| e.to_string())?;
-        Ok(true)
-    } else {
-        Err("没有正在运行的任务。".to_string())
+    if let Some(pid) = pid {
+        force_kill_tree(pid);
     }
+
+    // Also drop the Child handle
+    {
+        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
+        *guard = None;
+    }
+
+    Ok(true)
 }
 
 #[tauri::command]

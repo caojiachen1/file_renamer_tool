@@ -1,0 +1,20 @@
+[package]
+name = "file-renamer-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "file_renamer"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+crc32fast = "1"
+blake2 = "0.10"
+hex = "0.4"
+memmap2 = "0.9"
+num_cpus = "1"

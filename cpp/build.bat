@@ -50,11 +50,11 @@ if exist "build\Release\file_renamer_cli.exe" (
     echo   Release: build\Release\file_renamer_cli.exe
     echo   Copying executable to project root...
     
-    copy "build\Release\file_renamer_cli.exe" "file_renamer.exe" >nul
+    copy "build\Release\file_renamer_cli.exe" "..\file_renamer.exe" >nul
     if errorlevel 1 (
         echo   Warning: Failed to copy executable to project root
     ) else (
-        echo   Successfully copied to: file_renamer.exe
+        echo   Successfully copied to: ..\file_renamer.exe
     )
 ) else (
     echo   Release: Not found

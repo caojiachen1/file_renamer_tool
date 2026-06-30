@@ -3,6 +3,7 @@ node_modules/
 
 # Rust / Tauri
 src-tauri/target/
+rust/target/
 
 # Tauri build output
 dist/
