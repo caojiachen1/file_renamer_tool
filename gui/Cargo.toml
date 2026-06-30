@@ -1,0 +1,15 @@
+[package]
+name = "file-renamer-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "FileRenamer"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio"] }
+file-renamer-lib = { path = "../rust" }
+tokio = { version = "1", features = ["full"] }
+num_cpus = "1"
+rfd = "0.15"

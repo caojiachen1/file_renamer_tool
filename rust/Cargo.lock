@@ -184,7 +184,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "file-renamer-cli"
+name = "file-renamer-lib"
 version = "0.1.0"
 dependencies = [
  "blake2",

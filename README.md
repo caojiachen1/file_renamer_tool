@@ -1,6 +1,6 @@
 # File Renamer Tool
 
-A batch file renaming tool that uses hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B) to rename files. Available as CLI tools (C++ and Rust) and a Tauri desktop application.
+A batch file renaming tool that uses hash algorithms (MD5, SHA1, SHA256, SHA512, CRC32, BLAKE2B) to rename files. Available as CLI tools (C++ and Rust), a Tauri desktop application, and an iced native GUI.
 
 ## Project Structure
 
@@ -10,9 +10,12 @@ FileRenamerTool/
 │   ├── file_renamer_cli.cpp
 │   ├── CMakeLists.txt
 │   └── build.bat
-├── rust/                   # Rust CLI implementation
+├── rust/                   # Rust library + CLI
 │   ├── Cargo.toml
 │   ├── build.bat
+│   └── src/
+├── gui/                    # iced native GUI (Fluent Design)
+│   ├── Cargo.toml
 │   └── src/
 ├── src-tauri/              # Tauri desktop application
 │   ├── src/
@@ -91,6 +94,28 @@ file_renamer.exe C:\MyFiles -e -x txt -t 8
 
 # Auto-confirm execution
 file_renamer.exe C:\MyFiles -e -y
+```
+
+## iced Native GUI
+
+A native desktop application built with iced, featuring a Fluent Design dark theme.
+
+**Features:**
+- Native GPU-accelerated rendering
+- Fluent Design dark theme (accent colors, rounded corners, clean typography)
+- Real-time streaming output with scrollable text area
+- All CLI options available in the GUI
+- Direct library integration (no external process spawning)
+
+**Build:**
+```cmd
+cd gui
+cargo build --release
+```
+
+**Run:**
+```cmd
+gui\target\release\FileRenamer.exe
 ```
 
 ## Tauri Desktop Application

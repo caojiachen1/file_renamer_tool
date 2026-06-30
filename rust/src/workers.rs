@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Condvar};
@@ -9,6 +8,9 @@ use std::time::Instant;
 use crate::file_ops;
 use crate::hash::{self, Algorithm};
 use crate::scanner::{self, ScannedFile};
+use crate::ProgressReporter;
+
+pub type SharedReporter = Arc<dyn ProgressReporter + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FailedRenameInfo {
@@ -100,47 +102,41 @@ pub fn process_single_threaded(
     recursive: bool,
     dry_run: bool,
     allowed_extensions: HashSet<String>,
+    reporter: SharedReporter,
 ) {
     let start = Instant::now();
 
     if !directory.exists() || !directory.is_dir() {
-        eprintln!("Error: Invalid directory path: {}", directory.display());
+        reporter.on_output(&format!("Error: Invalid directory path: {}\n", directory.display()));
         return;
     }
 
-    println!("Scanning directory: {}", directory.display());
-    println!("Algorithm: {}", algorithm);
-    println!("Recursive: {}", if recursive { "Yes" } else { "No" });
-    println!("Mode: {}", if dry_run { "Preview" } else { "Execute" });
-    println!("Processing device: CPU");
+    reporter.on_output(&format!("Scanning directory: {}\n", directory.display()));
+    reporter.on_output(&format!("Algorithm: {}\n", algorithm));
+    reporter.on_output(&format!("Recursive: {}\n", if recursive { "Yes" } else { "No" }));
+    reporter.on_output(&format!("Mode: {}\n", if dry_run { "Preview" } else { "Execute" }));
+    reporter.on_output("Processing device: CPU\n");
 
     if !allowed_extensions.is_empty() {
-        print!("Extensions filter: ");
-        for (i, ext) in allowed_extensions.iter().enumerate() {
-            print!("\"{}\"", ext);
-            if i < allowed_extensions.len() - 1 {
-                print!(", ");
-            }
-        }
-        println!();
+        let exts: Vec<&str> = allowed_extensions.iter().map(|s| s.as_str()).collect();
+        reporter.on_output(&format!("Extensions filter: {}\n", exts.join(", ")));
     } else {
-        println!("Extensions filter: All files");
+        reporter.on_output("Extensions filter: All files\n");
     }
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let scan_start = Instant::now();
     let files = scanner::scan_directory(directory, recursive, &allowed_extensions);
     let scan_duration = scan_start.elapsed();
-    println!(
-        "Found {} files in {}ms.",
+    reporter.on_output(&format!(
+        "Found {} files in {}ms.\n\n",
         files.len(),
         scan_duration.as_millis()
-    );
-    println!();
+    ));
 
     if files.is_empty() {
-        println!("No files found to process.");
+        reporter.on_output("No files found to process.\n");
         return;
     }
 
@@ -153,19 +149,18 @@ pub fn process_single_threaded(
     for (idx, scanned) in files.iter().enumerate() {
         let file = &scanned.path;
         let file_name = file.file_name().and_then(|n| n.to_str()).unwrap_or("<Error reading filename>");
-        println!(
-            "[{}/{}] Processing: \"{}\"",
+        reporter.on_output(&format!(
+            "[{}/{}] Processing: \"{}\"\n",
             idx + 1,
             files.len(),
             file_name
-        );
+        ));
 
         processed_count += 1;
 
         let hash_result = hash::process_single_file(file, algorithm);
         if !hash_result.success {
-            println!("  Error: {}", hash_result.error);
-            println!();
+            reporter.on_output(&format!("  Error: {}\n\n", hash_result.error));
             continue;
         }
 
@@ -175,20 +170,20 @@ pub fn process_single_threaded(
         let new_filename = format!("{}.{}", hash_result.hash, extension);
         let new_path = file.parent().unwrap_or(file).join(&new_filename);
 
-        println!("  Hash ({}): {}", algorithm, hash_result.hash);
-        println!("  New name: {}", new_filename);
+        reporter.on_output(&format!("  Hash ({}): {}\n", algorithm, hash_result.hash));
+        reporter.on_output(&format!("  New name: {}\n", new_filename));
 
         if file.file_name() == new_path.file_name() {
-            println!("  Status: No change needed (filename already matches hash)");
+            reporter.on_output("  Status: No change needed (filename already matches hash)\n");
             no_change_count += 1;
         } else if !dry_run {
             match file_ops::rename_file(file, &new_path) {
                 Ok(()) => {
-                    println!("  Status: Renamed successfully");
+                    reporter.on_output("  Status: Renamed successfully\n");
                     success_count += 1;
                 }
                 Err(e) => {
-                    println!("  Status: Failed to rename");
+                    reporter.on_output("  Status: Failed to rename\n");
                     failed_renames.add(FailedRenameInfo {
                         file_path: file.clone(),
                         file_name: file_name.to_string(),
@@ -200,57 +195,53 @@ pub fn process_single_threaded(
                 }
             }
         } else {
-            println!("  Status: Preview only (will be renamed)");
+            reporter.on_output("  Status: Preview only (will be renamed)\n");
         }
-        println!();
-        let _ = io::stdout().flush();
+        reporter.on_output("\n");
     }
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let total_duration = start.elapsed();
 
-    println!("Summary:");
-    println!("Total files: {}", files.len());
-    println!("Processed: {}", processed_count);
-    println!("Skipped (filter): {}", skipped_count);
-    println!("No change needed: {}", no_change_count);
+    reporter.on_output("Summary:\n");
+    reporter.on_output(&format!("Total files: {}\n", files.len()));
+    reporter.on_output(&format!("Processed: {}\n", processed_count));
+    reporter.on_output(&format!("Skipped (filter): {}\n", skipped_count));
+    reporter.on_output(&format!("No change needed: {}\n", no_change_count));
     if !dry_run {
-        println!("Successfully renamed: {}", success_count);
+        reporter.on_output(&format!("Successfully renamed: {}\n", success_count));
         let failed_count = processed_count - success_count - no_change_count;
-        println!("Failed: {}", failed_count);
+        reporter.on_output(&format!("Failed: {}\n", failed_count));
 
         if failed_count > 0 && failed_renames.count() > 0 {
-            println!();
-            println!("============================================");
-            println!("FAILED RENAMES ({} files):", failed_renames.count());
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
+            reporter.on_output(&format!("FAILED RENAMES ({} files):\n", failed_renames.count()));
+            reporter.on_output("============================================\n");
 
             for fail in failed_renames.get_all() {
-                println!();
-                println!("[{}] File: {}", fail.file_index, fail.file_name);
-                println!("    Path: {}", fail.file_path.display());
-                println!("    Error: {}", fail.error_code);
-                println!("    Message: {}", fail.error_message);
+                reporter.on_output(&format!("\n[{}] File: {}\n", fail.file_index, fail.file_name));
+                reporter.on_output(&format!("    Path: {}\n", fail.file_path.display()));
+                reporter.on_output(&format!("    Error: {}\n", fail.error_code));
+                reporter.on_output(&format!("    Message: {}\n", fail.error_message));
                 if !fail.suggestion.is_empty() {
-                    println!("    Hint: {}", fail.suggestion);
+                    reporter.on_output(&format!("    Hint: {}\n", fail.suggestion));
                 }
             }
-            println!();
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
         }
     }
 
-    println!(
-        "Total execution time: {}ms",
+    reporter.on_output(&format!(
+        "Total execution time: {}ms\n",
         total_duration.as_millis()
-    );
+    ));
 
     if processed_count > 0 {
         let avg = total_duration.as_millis() as f64 / processed_count as f64;
-        println!("Average time per file: {:.2}ms", avg);
+        reporter.on_output(&format!("Average time per file: {:.2}ms\n", avg));
         let throughput = processed_count as f64 * 1000.0 / total_duration.as_millis() as f64;
-        println!("Throughput: {:.2} files/second", throughput);
+        reporter.on_output(&format!("Throughput: {:.2} files/second\n", throughput));
     }
 }
 
@@ -261,48 +252,42 @@ pub fn process_multi_threaded(
     dry_run: bool,
     allowed_extensions: HashSet<String>,
     num_threads: usize,
+    reporter: SharedReporter,
 ) {
     let start = Instant::now();
 
     if !directory.exists() || !directory.is_dir() {
-        eprintln!("Error: Invalid directory path: {}", directory.display());
+        reporter.on_output(&format!("Error: Invalid directory path: {}\n", directory.display()));
         return;
     }
 
-    println!("Scanning directory: {}", directory.display());
-    println!("Algorithm: {}", algorithm);
-    println!("Recursive: {}", if recursive { "Yes" } else { "No" });
-    println!("Mode: {}", if dry_run { "Preview" } else { "Execute" });
-    println!("Threads: {}", num_threads);
-    println!("Processing device: CPU");
+    reporter.on_output(&format!("Scanning directory: {}\n", directory.display()));
+    reporter.on_output(&format!("Algorithm: {}\n", algorithm));
+    reporter.on_output(&format!("Recursive: {}\n", if recursive { "Yes" } else { "No" }));
+    reporter.on_output(&format!("Mode: {}\n", if dry_run { "Preview" } else { "Execute" }));
+    reporter.on_output(&format!("Threads: {}\n", num_threads));
+    reporter.on_output("Processing device: CPU\n");
 
     if !allowed_extensions.is_empty() {
-        print!("Extensions filter: ");
-        for (i, ext) in allowed_extensions.iter().enumerate() {
-            print!("\"{}\"", ext);
-            if i < allowed_extensions.len() - 1 {
-                print!(", ");
-            }
-        }
-        println!();
+        let exts: Vec<&str> = allowed_extensions.iter().map(|s| s.as_str()).collect();
+        reporter.on_output(&format!("Extensions filter: {}\n", exts.join(", ")));
     } else {
-        println!("Extensions filter: All files");
+        reporter.on_output("Extensions filter: All files\n");
     }
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let scan_start = Instant::now();
     let files = scanner::scan_directory(directory, recursive, &allowed_extensions);
     let scan_duration = scan_start.elapsed();
-    println!(
-        "Found {} files in {}ms.",
+    reporter.on_output(&format!(
+        "Found {} files in {}ms.\n\n",
         files.len(),
         scan_duration.as_millis()
-    );
-    println!();
+    ));
 
     if files.is_empty() {
-        println!("No files found to process.");
+        reporter.on_output("No files found to process.\n");
         return;
     }
 
@@ -344,8 +329,9 @@ pub fn process_multi_threaded(
     let out_cv = Arc::clone(&output_cv);
     let out_cv_mutex = Arc::clone(&output_cv_mutex);
     let out_done = Arc::clone(&workers_done);
+    let out_reporter = Arc::clone(&reporter);
     let output_handle = thread::spawn(move || {
-        output_worker_fn(out_bufs, out_next, out_cv, out_cv_mutex, out_done, total_files);
+        output_worker_fn(out_bufs, out_next, out_cv, out_cv_mutex, out_done, total_files, out_reporter);
     });
 
     for h in handles {
@@ -360,54 +346,51 @@ pub fn process_multi_threaded(
 
     let _ = output_handle.join();
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let total_duration = start.elapsed();
 
-    println!("Summary:");
-    println!("Total files: {}", total_files);
-    println!("Processed: {}", ctx.processed_count.load(Ordering::Relaxed));
-    println!("Skipped (filter): {}", ctx.skipped_count.load(Ordering::Relaxed));
-    println!("No change needed: {}", ctx.no_change_count.load(Ordering::Relaxed));
+    reporter.on_output("Summary:\n");
+    reporter.on_output(&format!("Total files: {}\n", total_files));
+    reporter.on_output(&format!("Processed: {}\n", ctx.processed_count.load(Ordering::Relaxed)));
+    reporter.on_output(&format!("Skipped (filter): {}\n", ctx.skipped_count.load(Ordering::Relaxed)));
+    reporter.on_output(&format!("No change needed: {}\n", ctx.no_change_count.load(Ordering::Relaxed)));
     if !dry_run {
-        println!("Successfully renamed: {}", ctx.success_count.load(Ordering::Relaxed));
+        reporter.on_output(&format!("Successfully renamed: {}\n", ctx.success_count.load(Ordering::Relaxed)));
         let failed_count = ctx.processed_count.load(Ordering::Relaxed)
             - ctx.success_count.load(Ordering::Relaxed)
             - ctx.no_change_count.load(Ordering::Relaxed);
-        println!("Failed: {}", failed_count);
+        reporter.on_output(&format!("Failed: {}\n", failed_count));
 
         if failed_count > 0 && ctx.failed_renames.count() > 0 {
-            println!();
-            println!("============================================");
-            println!("FAILED RENAMES ({} files):", ctx.failed_renames.count());
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
+            reporter.on_output(&format!("FAILED RENAMES ({} files):\n", ctx.failed_renames.count()));
+            reporter.on_output("============================================\n");
 
             for fail in ctx.failed_renames.get_all() {
-                println!();
-                println!("[{}] File: {}", fail.file_index, fail.file_name);
-                println!("    Path: {}", fail.file_path.display());
-                println!("    Error: {}", fail.error_code);
-                println!("    Message: {}", fail.error_message);
+                reporter.on_output(&format!("\n[{}] File: {}\n", fail.file_index, fail.file_name));
+                reporter.on_output(&format!("    Path: {}\n", fail.file_path.display()));
+                reporter.on_output(&format!("    Error: {}\n", fail.error_code));
+                reporter.on_output(&format!("    Message: {}\n", fail.error_message));
                 if !fail.suggestion.is_empty() {
-                    println!("    Hint: {}", fail.suggestion);
+                    reporter.on_output(&format!("    Hint: {}\n", fail.suggestion));
                 }
             }
-            println!();
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
         }
     }
 
-    println!("Total execution time: {}ms", total_duration.as_millis());
+    reporter.on_output(&format!("Total execution time: {}ms\n", total_duration.as_millis()));
 
     if ctx.processed_count.load(Ordering::Relaxed) > 0 {
         let pc = ctx.processed_count.load(Ordering::Relaxed);
         let avg = total_duration.as_millis() as f64 / pc as f64;
-        println!("Average time per file: {:.2}ms", avg);
+        reporter.on_output(&format!("Average time per file: {:.2}ms\n", avg));
         let throughput = pc as f64 * 1000.0 / total_duration.as_millis() as f64;
-        println!("Throughput: {:.2} files/second", throughput);
+        reporter.on_output(&format!("Throughput: {:.2} files/second\n", throughput));
     }
 
-    println!("Performance: {} threads utilized with sequential output", num_threads);
+    reporter.on_output(&format!("Performance: {} threads utilized with sequential output\n", num_threads));
 }
 
 fn worker_fn(
@@ -501,6 +484,7 @@ fn output_worker_fn(
     cv_mutex: Arc<Mutex<()>>,
     workers_done: Arc<AtomicBool>,
     total_files: usize,
+    reporter: SharedReporter,
 ) {
     loop {
         let current = next_output.load(Ordering::Relaxed);
@@ -539,8 +523,7 @@ fn output_worker_fn(
             };
             match entry {
                 Some(e) if e.ready => {
-                    print!("{}", e.content);
-                    let _ = io::stdout().flush();
+                    reporter.on_output(&e.content);
                     next_output.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => break,
@@ -557,49 +540,43 @@ pub fn process_batch_mode(
     allowed_extensions: HashSet<String>,
     num_threads: usize,
     batch_size: usize,
+    reporter: SharedReporter,
 ) {
     let start = Instant::now();
 
     if !directory.exists() || !directory.is_dir() {
-        eprintln!("Error: Invalid directory path: {}", directory.display());
+        reporter.on_output(&format!("Error: Invalid directory path: {}\n", directory.display()));
         return;
     }
 
-    println!("Scanning directory: {}", directory.display());
-    println!("Algorithm: {}", algorithm);
-    println!("Recursive: {}", if recursive { "Yes" } else { "No" });
-    println!("Mode: {}", if dry_run { "Preview" } else { "Execute" });
-    println!("Threads: {}", num_threads);
-    println!("Batch size: {}", batch_size);
-    println!("Processing device: CPU");
+    reporter.on_output(&format!("Scanning directory: {}\n", directory.display()));
+    reporter.on_output(&format!("Algorithm: {}\n", algorithm));
+    reporter.on_output(&format!("Recursive: {}\n", if recursive { "Yes" } else { "No" }));
+    reporter.on_output(&format!("Mode: {}\n", if dry_run { "Preview" } else { "Execute" }));
+    reporter.on_output(&format!("Threads: {}\n", num_threads));
+    reporter.on_output(&format!("Batch size: {}\n", batch_size));
+    reporter.on_output("Processing device: CPU\n");
 
     if !allowed_extensions.is_empty() {
-        print!("Extensions filter: ");
-        for (i, ext) in allowed_extensions.iter().enumerate() {
-            print!("\"{}\"", ext);
-            if i < allowed_extensions.len() - 1 {
-                print!(", ");
-            }
-        }
-        println!();
+        let exts: Vec<&str> = allowed_extensions.iter().map(|s| s.as_str()).collect();
+        reporter.on_output(&format!("Extensions filter: {}\n", exts.join(", ")));
     } else {
-        println!("Extensions filter: All files");
+        reporter.on_output("Extensions filter: All files\n");
     }
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let scan_start = Instant::now();
     let mut files = scanner::scan_directory(directory, recursive, &allowed_extensions);
     let scan_duration = scan_start.elapsed();
-    println!(
-        "Found {} files in {}ms.",
+    reporter.on_output(&format!(
+        "Found {} files in {}ms.\n\n",
         files.len(),
         scan_duration.as_millis()
-    );
-    println!();
+    ));
 
     if files.is_empty() {
-        println!("No files found to process.");
+        reporter.on_output("No files found to process.\n");
         return;
     }
 
@@ -612,11 +589,10 @@ pub fn process_batch_mode(
         .map(|chunk| chunk.to_vec())
         .collect();
 
-    println!(
-        "Created {} batches for processing.",
+    reporter.on_output(&format!(
+        "Created {} batches for processing.\n\n",
         batches.len()
-    );
-    println!();
+    ));
 
     let ctx = Arc::new(WorkerContext {
         files,
@@ -646,58 +622,55 @@ pub fn process_batch_mode(
         let _ = h.join();
     }
 
-    println!("===========================================");
+    reporter.on_output("===========================================\n");
 
     let total_duration = start.elapsed();
 
-    println!("Summary:");
-    println!("Total files: {}", total_files);
-    println!("Processed: {}", ctx.processed_count.load(Ordering::Relaxed));
-    println!("Skipped (filter): {}", ctx.skipped_count.load(Ordering::Relaxed));
-    println!("No change needed: {}", ctx.no_change_count.load(Ordering::Relaxed));
+    reporter.on_output("Summary:\n");
+    reporter.on_output(&format!("Total files: {}\n", total_files));
+    reporter.on_output(&format!("Processed: {}\n", ctx.processed_count.load(Ordering::Relaxed)));
+    reporter.on_output(&format!("Skipped (filter): {}\n", ctx.skipped_count.load(Ordering::Relaxed)));
+    reporter.on_output(&format!("No change needed: {}\n", ctx.no_change_count.load(Ordering::Relaxed)));
     if !dry_run {
-        println!("Successfully renamed: {}", ctx.success_count.load(Ordering::Relaxed));
+        reporter.on_output(&format!("Successfully renamed: {}\n", ctx.success_count.load(Ordering::Relaxed)));
         let failed_count = ctx.processed_count.load(Ordering::Relaxed)
             - ctx.success_count.load(Ordering::Relaxed)
             - ctx.no_change_count.load(Ordering::Relaxed);
-        println!("Failed: {}", failed_count);
+        reporter.on_output(&format!("Failed: {}\n", failed_count));
 
         if failed_count > 0 && ctx.failed_renames.count() > 0 {
-            println!();
-            println!("============================================");
-            println!("FAILED RENAMES ({} files):", ctx.failed_renames.count());
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
+            reporter.on_output(&format!("FAILED RENAMES ({} files):\n", ctx.failed_renames.count()));
+            reporter.on_output("============================================\n");
 
             for fail in ctx.failed_renames.get_all() {
-                println!();
-                println!("[{}] File: {}", fail.file_index, fail.file_name);
-                println!("    Path: {}", fail.file_path.display());
-                println!("    Error: {}", fail.error_code);
-                println!("    Message: {}", fail.error_message);
+                reporter.on_output(&format!("\n[{}] File: {}\n", fail.file_index, fail.file_name));
+                reporter.on_output(&format!("    Path: {}\n", fail.file_path.display()));
+                reporter.on_output(&format!("    Error: {}\n", fail.error_code));
+                reporter.on_output(&format!("    Message: {}\n", fail.error_message));
                 if !fail.suggestion.is_empty() {
-                    println!("    Hint: {}", fail.suggestion);
+                    reporter.on_output(&format!("    Hint: {}\n", fail.suggestion));
                 }
             }
-            println!();
-            println!("============================================");
+            reporter.on_output("\n============================================\n");
         }
     }
 
-    println!("Total execution time: {}ms", total_duration.as_millis());
+    reporter.on_output(&format!("Total execution time: {}ms\n", total_duration.as_millis()));
 
     if ctx.processed_count.load(Ordering::Relaxed) > 0 {
         let pc = ctx.processed_count.load(Ordering::Relaxed);
         let avg = total_duration.as_millis() as f64 / pc as f64;
-        println!("Average time per file: {:.2}ms", avg);
+        reporter.on_output(&format!("Average time per file: {:.2}ms\n", avg));
         let throughput = pc as f64 * 1000.0 / total_duration.as_millis() as f64;
-        println!("Throughput: {:.2} files/second", throughput);
+        reporter.on_output(&format!("Throughput: {:.2} files/second\n", throughput));
     }
 
-    println!(
-        "Performance: {} threads, {} batches utilized",
+    reporter.on_output(&format!(
+        "Performance: {} threads, {} batches utilized\n",
         num_threads,
         batches.len()
-    );
+    ));
 }
 
 fn batch_worker_fn(
@@ -736,7 +709,6 @@ fn batch_worker_fn(
                 ctx.skipped_count.fetch_add(1, Ordering::Relaxed);
                 let _guard = stdout_mutex.lock().unwrap();
                 print!("{}", out);
-                let _ = io::stdout().flush();
                 continue;
             }
 
@@ -754,7 +726,6 @@ fn batch_worker_fn(
                 out.push_str(&format!("  Error: {}\n\n", hash_result.error));
                 let _guard = stdout_mutex.lock().unwrap();
                 print!("{}", out);
-                let _ = io::stdout().flush();
                 continue;
             }
 
@@ -796,7 +767,6 @@ fn batch_worker_fn(
 
             let _guard = stdout_mutex.lock().unwrap();
             print!("{}", out);
-            let _ = io::stdout().flush();
         }
     }
 }

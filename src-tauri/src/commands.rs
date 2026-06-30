@@ -1,103 +1,68 @@
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tauri::Emitter;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use file_renamer_lib::{Algorithm, ProcessOptions, ProcessingMode, ProgressReporter, process_directory};
 
+/// Shared state for the processing task
 pub struct AppState {
-    current_child: Arc<Mutex<Option<Child>>>,
-    current_pid: Arc<Mutex<Option<u32>>>,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            current_child: Arc::new(Mutex::new(None)),
-            current_pid: Arc::new(Mutex::new(None)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-/// Force-kill a process tree on Windows using taskkill /F /T
-fn force_kill_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+/// Tauri event reporter that batches output to reduce IPC overhead
+struct TauriReporter {
+    app: tauri::AppHandle,
+    buffer: Mutex<String>,
+    last_flush: Mutex<Instant>,
 }
 
-fn find_executable() -> Option<PathBuf> {
-    if let Ok(env_path) = std::env::var("FILE_RENAMER_EXE") {
-        let p = PathBuf::from(&env_path);
-        if p.exists() {
-            return Some(p);
+impl TauriReporter {
+    fn new(app: tauri::AppHandle) -> Self {
+        Self {
+            app,
+            buffer: Mutex::new(String::with_capacity(8192)),
+            last_flush: Mutex::new(Instant::now()),
         }
     }
 
-    let sidecar_names = [
-        "file_renamer.exe",
-        "file_renamer-cli.exe",
-    ];
-
-    let bases: Vec<PathBuf> = vec![
-        std::env::current_dir()
-            .ok()
-            .and_then(|d| d.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|d| d.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default(),
-        std::env::current_dir().unwrap_or_default(),
-    ];
-
-    for base in &bases {
-        for name in &sidecar_names {
-            let p = base.join(name);
-            if p.exists() {
-                return Some(p);
-            }
+    fn flush(&self) {
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.is_empty() {
+            return;
         }
+        let text = std::mem::take(&mut *buf);
+        drop(buf);
+        let _ = self.app.emit("cli-output", serde_json::json!({"text": text}));
     }
 
-    let rust_build_rel = [
-        "rust/target/release/file_renamer.exe",
-        "rust/target/debug/file_renamer.exe",
-    ];
-    for base in &bases {
-        for rel in &rust_build_rel {
-            let p = base.join(rel);
-            if p.exists() {
-                return Some(p);
-            }
+    fn try_flush(&self) {
+        let should_flush = {
+            let buf = self.buffer.lock().unwrap();
+            let last = self.last_flush.lock().unwrap();
+            buf.len() > 4096 || last.elapsed() > Duration::from_millis(50)
+        };
+        if should_flush {
+            self.flush();
+            *self.last_flush.lock().unwrap() = Instant::now();
         }
     }
-
-    let cpp_build_rel = [
-        "build/Release/file_renamer_cli.exe",
-        "build/Debug/file_renamer_cli_d.exe",
-        "build/Release/file_renamer.exe",
-    ];
-    for base in &bases {
-        for rel in &cpp_build_rel {
-            let p = base.join(rel);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    None
 }
 
-#[tauri::command]
-pub fn which_exe() -> serde_json::Value {
-    let exe = find_executable();
-    serde_json::json!({
-        "path": exe.as_ref().map(|p| p.to_string_lossy().to_string()),
-        "exists": exe.as_ref().map_or(false, |p| p.exists()),
-    })
+impl ProgressReporter for TauriReporter {
+    fn on_output(&self, text: &str) {
+        self.buffer.lock().unwrap().push_str(text);
+        self.try_flush();
+    }
 }
 
 #[tauri::command]
@@ -111,10 +76,10 @@ pub async fn run_cli(
     threads: Option<String>,
     batch: Option<String>,
     execute: Option<bool>,
-    yes: Option<bool>,
+    _yes: Option<bool>,
     recursive: Option<bool>,
-    buffer_kb: Option<String>,
-    mmap_chunk_mb: Option<String>,
+    _buffer_kb: Option<String>,
+    _mmap_chunk_mb: Option<String>,
 ) -> Result<(), String> {
     let dir = directory.trim().to_string();
     if dir.is_empty() {
@@ -128,156 +93,79 @@ pub async fn run_cli(
         return Err(format!("路径不是文件夹: {}", dir));
     }
 
-    let exe = find_executable().ok_or("找不到可执行文件 file_renamer.exe")?;
-
-    let mut args: Vec<String> = vec![exe.to_string_lossy().to_string(), dir];
+    // Reset cancel flag
+    state.cancel_flag.store(false, Ordering::Relaxed);
 
     let algo = algorithm.unwrap_or_else(|| "MD5".to_string()).to_uppercase();
-    if !["MD5", "SHA1", "SHA256", "SHA512", "CRC32", "BLAKE2B"].contains(&algo.as_str()) {
-        return Err(format!("不支持的算法: {}", algo));
-    }
-    if algo != "MD5" {
-        args.extend_from_slice(&["-a".to_string(), algo]);
-    }
+    let algorithm = match Algorithm::from_str(&algo) {
+        Some(a) => a,
+        None => {
+            return Err(format!("不支持的算法: {}", algo));
+        }
+    };
 
     let m = mode.unwrap_or_else(|| "multi-thread".to_string()).to_lowercase();
-    if m == "single-thread" {
-        args.push("--single-thread".to_string());
-    } else if m == "batch-mode" {
-        args.push("--batch-mode".to_string());
-    }
+    let processing_mode = match m.as_str() {
+        "single-thread" => ProcessingMode::SingleThread,
+        "batch-mode" => ProcessingMode::BatchMode,
+        _ => ProcessingMode::MultiThread,
+    };
 
-    if recursive.unwrap_or(false) {
-        args.push("-r".to_string());
-    }
+    let dry_run = !execute.unwrap_or(false);
 
-    if execute.unwrap_or(false) {
-        args.push("-e".to_string());
-        if yes.unwrap_or(false) {
-            args.push("-y".to_string());
+    let allowed_extensions: HashSet<String> = match extensions.as_ref() {
+        Some(ext) if !ext.trim().is_empty() => {
+            ext.split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let trimmed = s.trim().trim_start_matches('.').to_lowercase();
+                    if trimmed.starts_with('.') { trimmed } else { format!(".{}", trimmed) }
+                })
+                .collect()
         }
-    }
+        _ => HashSet::new(),
+    };
 
-    if let Some(t) = threads.as_ref().filter(|s| !s.trim().is_empty()) {
-        args.extend_from_slice(&["-t".to_string(), t.trim().to_string()]);
-    }
-    if let Some(b) = batch.as_ref().filter(|s| !s.trim().is_empty()) {
-        args.extend_from_slice(&["-b".to_string(), b.trim().to_string()]);
-    }
-    if let Some(ext) = extensions.as_ref().filter(|s| !s.trim().is_empty()) {
-        let parts: Vec<String> = ext
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.trim().trim_start_matches('.').to_lowercase())
-            .collect();
-        let norm: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
-        if !norm.is_empty() {
-            args.extend_from_slice(&["-x".to_string(), norm.join(",")]);
-        }
-    }
-
-    if let Some(v) = buffer_kb.as_ref().filter(|s| !s.trim().is_empty()) {
-        args.extend_from_slice(&["--buffer-kb".to_string(), v.trim().to_string()]);
-    }
-    if let Some(v) = mmap_chunk_mb.as_ref().filter(|s| !s.trim().is_empty()) {
-        args.extend_from_slice(&["--mmap-chunk-mb".to_string(), v.trim().to_string()]);
-    }
-
-    let cmd_display = args.join(" ");
-    app.emit("cli-output", serde_json::json!({"text": format!("运行命令: {}\n\n", cmd_display)}))
-        .map_err(|e| e.to_string())?;
-
-    // Kill any existing process tree by PID
-    {
-        let old_pid = {
-            let mut guard = state.current_pid.lock().map_err(|e| e.to_string())?;
-            guard.take()
-        };
-        if let Some(pid) = old_pid {
-            force_kill_tree(pid);
-        }
-        // Also drop any lingering Child handle
-        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
-        *guard = None;
-    }
-
-    let mut child = Command::new(&args[0])
-        .args(&args[1..])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x08000000)
-        .spawn()
-        .map_err(|e| format!("启动失败: {}", e))?;
-
-    let pid = child.id().unwrap_or(0);
-
-    let stdout = child.stdout.take().ok_or("无法获取进程输出")?;
-    let stderr = child.stderr.take().ok_or("无法获取进程输出")?;
-
-    // Store both Child (for reading) and PID (for killing)
-    {
-        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
-        *guard = Some(child);
-        let mut pid_guard = state.current_pid.lock().map_err(|e| e.to_string())?;
-        *pid_guard = Some(pid);
-    }
-
-    let app_stderr = app.clone();
-    let app_stdout = app.clone();
-    let app_final = app.clone();
-    let state_child = state.inner().current_child.clone();
-    let state_pid = state.inner().current_pid.clone();
-
-    tokio::spawn(async move {
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app_stderr.emit(
-                    "cli-output",
-                    serde_json::json!({"text": format!("{}\n", line)}),
-                );
-            }
+    let num_threads: usize = threads
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| {
+            let n = num_cpus::get();
+            if n == 0 { 4 } else { n }
         });
 
-        {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = app_stdout.emit(
-                    "cli-output",
-                    serde_json::json!({"text": format!("{}\n", line)}),
-                );
-            }
-        }
+    let batch_size: usize = batch
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| std::cmp::max(1, num_threads * 4));
 
-        let _ = stderr_task.await;
+    let options = ProcessOptions {
+        directory: dir_path,
+        algorithm,
+        recursive: recursive.unwrap_or(false),
+        dry_run,
+        allowed_extensions,
+        num_threads,
+        batch_size,
+        mode: processing_mode,
+    };
 
-        // Wait for the child to exit
-        let exit_code = {
-            let child_opt = {
-                let mut guard = state_child.lock().unwrap();
-                guard.take()
-            };
-            if let Some(mut child) = child_opt {
-                match child.wait().await {
-                    Ok(status) => status.code().unwrap_or(-1),
-                    Err(_) => -1,
-                }
-            } else {
-                -1
-            }
-        };
+    let reporter = Arc::new(TauriReporter::new(app.clone()));
 
-        // Clear PID
-        {
-            let mut guard = state_pid.lock().unwrap();
-            *guard = None;
-        }
+    // Run processing in a blocking thread to avoid blocking the async runtime
+    let _cancel_flag = state.cancel_flag.clone();
+    let reporter_for_done = reporter.clone();
+    tokio::task::spawn_blocking(move || {
+        process_directory(options, reporter);
 
-        let _ = app_final.emit(
+        // Flush any remaining buffered output
+        reporter_for_done.flush();
+
+        let _ = app.emit(
             "cli-output",
-            serde_json::json!({"text": format!("\n[exit-code] {}\n", exit_code), "done": true}),
+            serde_json::json!({"text": "", "done": true}),
         );
     });
 
@@ -286,22 +174,17 @@ pub async fn run_cli(
 
 #[tauri::command]
 pub async fn stop_cli(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    // Kill by PID first — guaranteed to kill entire process tree
-    let pid = {
-        let mut guard = state.current_pid.lock().map_err(|e| e.to_string())?;
-        guard.take()
-    };
-    if let Some(pid) = pid {
-        force_kill_tree(pid);
-    }
-
-    // Also drop the Child handle
-    {
-        let mut guard = state.current_child.lock().map_err(|e| e.to_string())?;
-        *guard = None;
-    }
-
+    state.cancel_flag.store(true, Ordering::Relaxed);
     Ok(true)
+}
+
+#[tauri::command]
+pub fn which_exe() -> serde_json::Value {
+    // Library mode - no external exe needed
+    serde_json::json!({
+        "path": "built-in",
+        "exists": true,
+    })
 }
 
 #[tauri::command]

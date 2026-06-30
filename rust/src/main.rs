@@ -1,18 +1,28 @@
 mod cli;
-mod file_ops;
-mod hash;
-mod scanner;
-mod workers;
 
 use clap::Parser;
 use std::collections::HashSet;
 use std::io::{self, Write};
+use std::path::PathBuf;
+
+use file_renamer_lib::{Algorithm, ProcessOptions, ProcessingMode, ProgressReporter, process_directory};
+use std::sync::Arc;
+
+struct StdoutReporter;
+
+impl ProgressReporter for StdoutReporter {
+    fn on_output(&self, text: &str) {
+        print!("{}", text);
+        let _ = io::stdout().flush();
+    }
+}
 
 fn main() {
     let args = cli::Args::parse();
 
     if args.directory.as_os_str().is_empty() {
-        workers::print_usage();
+        eprintln!("Usage: file_renamer <directory> [options]");
+        eprintln!("Run with --help for full options.");
         std::process::exit(1);
     }
 
@@ -23,7 +33,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let algorithm = match hash::Algorithm::from_str(&args.algorithm) {
+    let algorithm = match Algorithm::from_str(&args.algorithm) {
         Some(a) => a,
         None => {
             eprintln!("Error: Unsupported algorithm: {}", args.algorithm);
@@ -35,12 +45,6 @@ fn main() {
     let dry_run = !args.execute;
     let auto_confirm = args.yes;
     let recursive = args.recursive;
-
-    enum ProcessingMode {
-        MultiThread,
-        BatchMode,
-        SingleThread,
-    }
 
     let mode = if args.batch_mode {
         ProcessingMode::BatchMode
@@ -54,14 +58,6 @@ fn main() {
         Some(exts) => cli::parse_extensions(exts).into_iter().collect(),
         None => HashSet::new(),
     };
-
-    let total_ram_mb = sys_info();
-    let _buffer_kb = args.buffer_kb.unwrap_or_else(|| {
-        if total_ram_mb >= 8192 { 4096 } else { 2048 }
-    });
-    let _mmap_chunk_mb = args.mmap_chunk_mb.unwrap_or_else(|| {
-        if total_ram_mb >= 8192 { 16 } else { 8 }
-    });
 
     let num_threads = args.threads.unwrap_or_else(|| {
         let n = num_cpus::get();
@@ -98,74 +94,27 @@ fn main() {
 
     match mode {
         ProcessingMode::SingleThread => {
-            println!("Using single-threaded processing mode.");
-            workers::process_single_threaded(
-                &directory,
-                algorithm,
-                recursive,
-                dry_run,
-                allowed_extensions,
-            );
+            println!("Using single-threaded processing mode.\n");
         }
         ProcessingMode::MultiThread => {
-            println!("Using multi-threaded processing mode.");
-            workers::process_multi_threaded(
-                &directory,
-                algorithm,
-                recursive,
-                dry_run,
-                allowed_extensions,
-                num_threads,
-            );
+            println!("Using multi-threaded processing mode.\n");
         }
         ProcessingMode::BatchMode => {
-            println!("Using batch processing mode.");
-            workers::process_batch_mode(
-                &directory,
-                algorithm,
-                recursive,
-                dry_run,
-                allowed_extensions,
-                num_threads,
-                batch_size,
-            );
-        }
-    }
-}
-
-fn sys_info() -> u64 {
-    #[cfg(target_os = "windows")]
-    {
-        use std::mem;
-        #[repr(C)]
-        struct MEMORYSTATUSEX {
-            dw_length: u32,
-            dw_memory_load: u32,
-            ull_total_phys: u64,
-            ull_avail_phys: u64,
-            ull_total_page_file: u64,
-            ull_avail_page_file: u64,
-            ull_total_virtual: u64,
-            ull_avail_virtual: u64,
-            ull_avail_extended_virtual: u64,
-        }
-
-        extern "system" {
-            fn GlobalMemoryStatusEx(lpBuffer: *mut MEMORYSTATUSEX) -> i32;
-        }
-
-        let mut mem_info: MEMORYSTATUSEX = unsafe { mem::zeroed() };
-        mem_info.dw_length = mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let success = unsafe { GlobalMemoryStatusEx(&mut mem_info) };
-        if success != 0 {
-            mem_info.ull_total_phys / (1024 * 1024)
-        } else {
-            4096
+            println!("Using batch processing mode.\n");
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        4096
-    }
+    let options = ProcessOptions {
+        directory,
+        algorithm,
+        recursive,
+        dry_run,
+        allowed_extensions,
+        num_threads,
+        batch_size,
+        mode,
+    };
+
+    let reporter = Arc::new(StdoutReporter);
+    process_directory(options, reporter);
 }

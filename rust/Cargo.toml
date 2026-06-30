@@ -1,7 +1,11 @@
 [package]
-name = "file-renamer-cli"
+name = "file-renamer-lib"
 version = "0.1.0"
 edition = "2021"
+
+[lib]
+name = "file_renamer_lib"
+path = "src/lib.rs"
 
 [[bin]]
 name = "file_renamer"
