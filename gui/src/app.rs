@@ -1,17 +1,18 @@
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{Color, Element, Length, Subscription, Task, Theme, time};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use crossbeam_channel::{bounded, TryRecvError};
+use file_renamer_lib::{Algorithm, ProcessingMode, ProcessOptions, ProgressReporter};
 
 use crate::theme::colors;
 
 const ALG: &[&str] = &["MD5","SHA1","SHA256","SHA512","CRC32","BLAKE2B"];
 const MOD: &[(&str,&str)] = &[("multi-thread","Multi Thread (默认)"),("batch-mode","Batch Mode"),("single-thread","Single Thread")];
-const READ_BUF: usize = 256 * 1024;
-const BATCH_BUF: usize = 128 * 1024;
 const DISPLAY_LINES: usize = 2000;
 const LOG_DIR: &str = "logs";
 
@@ -33,7 +34,7 @@ pub struct App {
     log_writer: Option<BufWriter<File>>,
     log_path: Option<String>,
     total_lines: usize,
-    rx: Option<crossbeam_channel::Receiver<Vec<u8>>>,
+    rx: Option<crossbeam_channel::Receiver<String>>,
 }
 
 pub fn new() -> (App, Task<Message>) {
@@ -83,28 +84,44 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             app.log_path = Some(path.clone());
             app.log_writer = File::create(&path).ok().map(|f| BufWriter::with_capacity(64*1024, f));
 
-            let exe = find_cli_exe();
-            let mut args: Vec<String> = Vec::with_capacity(12);
-            args.push(app.directory.clone());
-            let a = ALG[app.algorithm_index];
-            if a != "MD5" { args.push("-a".into()); args.push(a.into()); }
-            match MOD[app.mode_index].0 {
-                "single-thread" => args.push("--single-thread".into()),
-                "batch-mode" => args.push("--batch-mode".into()),
-                _ => {}
-            }
-            if app.recursive { args.push("-r".into()); }
-            if app.execute { args.push("-e".into()); args.push("-y".into()); }
-            if !app.extensions.is_empty() { args.push("-x".into()); args.push(app.extensions.clone()); }
-            if !app.threads.is_empty() { args.push("-t".into()); args.push(app.threads.clone()); }
-            if !app.batch_size.is_empty() { args.push("-b".into()); args.push(app.batch_size.clone()); }
+            // Build options
+            let dir = PathBuf::from(&app.directory);
+            let a = match ALG[app.algorithm_index] {
+                "SHA1" => Algorithm::Sha1,
+                "SHA256" => Algorithm::Sha256,
+                "SHA512" => Algorithm::Sha512,
+                "CRC32" => Algorithm::Crc32,
+                "BLAKE2B" => Algorithm::Blake2b,
+                _ => Algorithm::Md5,
+            };
+            let mode = match MOD[app.mode_index].0 {
+                "single-thread" => ProcessingMode::SingleThread,
+                "batch-mode" => ProcessingMode::BatchMode,
+                _ => ProcessingMode::MultiThread,
+            };
+            let exts: HashSet<String> = if app.extensions.is_empty() {
+                HashSet::new()
+            } else {
+                app.extensions.split(',').map(|s| {
+                    let e = s.trim().to_lowercase();
+                    if e.starts_with('.') { e } else { format!(".{}", e) }
+                }).collect()
+            };
+            let threads: usize = app.threads.parse().unwrap_or_else(|_| num_cpus::get());
+            let batch: usize = app.batch_size.parse().unwrap_or(0);
 
-            let (tx, rx) = bounded(256);
+            let options = ProcessOptions {
+                directory: dir, algorithm: a, recursive: app.recursive,
+                dry_run: !app.execute, allowed_extensions: exts,
+                num_threads: threads, batch_size: batch, mode,
+            };
+
+            let (tx, rx) = bounded::<String>(256);
             app.rx = Some(rx);
+
             std::thread::spawn(move || {
-                if let Err(e) = run_cli_process(&exe, &args, &tx) {
-                    let _ = tx.send(format!("[ERROR] {}\n", e).into_bytes());
-                }
+                let reporter = Arc::new(ChannelReporter { tx });
+                file_renamer_lib::process_directory(options, reporter);
             });
         }
 
@@ -119,30 +136,25 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             app.cache_dirty = false;
             app.total_lines = 0;
         }
-        Message::LoadFullLog => {
-            load_full_log(app);
-        }
+        Message::LoadFullLog => { load_full_log(app); }
 
         Message::Tick => {
-            let mut chunks: Vec<Vec<u8>> = Vec::new();
+            let mut texts: Vec<String> = Vec::new();
             let mut disconnected = false;
             if let Some(rx) = &app.rx {
                 loop {
                     match rx.try_recv() {
-                        Ok(c) => chunks.push(c),
+                        Ok(t) => texts.push(t),
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => { disconnected = true; break; }
                     }
                 }
             }
 
-            // Drain remaining after disconnect (crossbeam guarantees data first)
             if disconnected {
-                // Process remaining chunks
-                for c in &chunks {
-                    if let Some(ref mut w) = app.log_writer { let _ = w.write_all(c); }
-                    let decoded = String::from_utf8_lossy(c);
-                    for line in decoded.split('\n') {
+                for t in &texts {
+                    if let Some(ref mut w) = app.log_writer { let _ = w.write_all(t.as_bytes()); }
+                    for line in t.split('\n') {
                         if line.is_empty() { continue; }
                         app.total_lines += 1;
                         if app.lines.len() >= DISPLAY_LINES { app.lines.pop_front(); }
@@ -158,18 +170,15 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
                 return Task::none();
             }
 
-            if chunks.is_empty() && !app.cache_dirty { return Task::none(); }
+            if texts.is_empty() && !app.cache_dirty { return Task::none(); }
 
-            // Write raw bytes to log file
             if let Some(ref mut w) = app.log_writer {
-                for c in &chunks { let _ = w.write_all(c); }
+                for t in &texts { let _ = w.write_all(t.as_bytes()); }
                 let _ = w.flush();
             }
 
-            // Decode + split, keep last DISPLAY_LINES for UI
-            for chunk in &chunks {
-                let decoded = String::from_utf8_lossy(chunk);
-                for line in decoded.split('\n') {
+            for t in &texts {
+                for line in t.split('\n') {
                     if line.is_empty() { continue; }
                     app.total_lines += 1;
                     if app.lines.len() >= DISPLAY_LINES { app.lines.pop_front(); }
@@ -182,6 +191,20 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
     }
     Task::none()
 }
+
+// ── Channel reporter ────────────────────────────────────────────────────────
+
+struct ChannelReporter {
+    tx: crossbeam_channel::Sender<String>,
+}
+
+impl ProgressReporter for ChannelReporter {
+    fn on_output(&self, text: &str) {
+        let _ = self.tx.send(text.to_string());
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn load_full_log(app: &mut App) {
     let Some(ref path) = app.log_path else { return };
@@ -204,84 +227,6 @@ fn rebuild_display(app: &mut App) {
     }
     app.display_cache = buf;
     app.cache_dirty = false;
-}
-
-fn run_cli_process(exe: &str, args: &[String], tx: &crossbeam_channel::Sender<Vec<u8>>) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut child = Command::new(exe).args(args)
-        .stdout(Stdio::piped()).stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn().map_err(|e| format!("spawn '{}': {}", exe, e))?;
-
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let stderr = child.stderr.take().ok_or("no stderr")?;
-
-    let tx1 = tx.clone();
-    std::thread::spawn(move || {
-        let mut batch = Vec::with_capacity(BATCH_BUF);
-        let mut buf = [0u8; READ_BUF];
-        let mut r = std::io::BufReader::with_capacity(READ_BUF, stdout);
-        loop {
-            match r.read(&mut buf) {
-                Ok(0)|Err(_) => break,
-                Ok(n) => {
-                    batch.extend_from_slice(&buf[..n]);
-                    if batch.len() >= BATCH_BUF {
-                        let _ = tx1.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BUF)));
-                    }
-                }
-            }
-        }
-        if !batch.is_empty() { let _ = tx1.send(batch); }
-    });
-
-    let tx2 = tx.clone();
-    std::thread::spawn(move || {
-        let mut batch = Vec::with_capacity(BATCH_BUF);
-        let mut buf = [0u8; READ_BUF];
-        let mut r = std::io::BufReader::with_capacity(READ_BUF, stderr);
-        loop {
-            match r.read(&mut buf) {
-                Ok(0)|Err(_) => break,
-                Ok(n) => {
-                    batch.extend_from_slice(&buf[..n]);
-                    if batch.len() >= BATCH_BUF {
-                        let _ = tx2.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BUF)));
-                    }
-                }
-            }
-        }
-        if !batch.is_empty() { let _ = tx2.send(batch); }
-    });
-
-    let _ = child.wait();
-    Ok(())
-}
-
-fn find_cli_exe() -> String {
-    let rel = ["file_renamer.exe","../file_renamer.exe","rust/target/release/file_renamer.exe","../rust/target/release/file_renamer.exe"];
-    for c in &rel {
-        if std::path::Path::new(c).exists() {
-            return std::fs::canonicalize(c).unwrap_or_else(|_| std::path::PathBuf::from(c))
-                .to_string_lossy().to_string();
-        }
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for c in &["file_renamer.exe","rust/target/release/file_renamer.exe"] {
-                let p = dir.join(c);
-                if p.exists() { return p.to_string_lossy().to_string(); }
-                if let Some(parent) = dir.parent() {
-                    let p2 = parent.join(c);
-                    if p2.exists() { return p2.to_string_lossy().to_string(); }
-                }
-            }
-        }
-    }
-    "file_renamer.exe".to_string()
 }
 
 fn timestamp_tag() -> String {
