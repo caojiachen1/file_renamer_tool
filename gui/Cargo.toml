@@ -13,3 +13,4 @@ file-renamer-lib = { path = "../rust" }
 tokio = { version = "1", features = ["full"] }
 num_cpus = "1"
 rfd = "0.15"
+crossbeam-channel = "0.5"
