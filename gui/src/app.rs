@@ -1,64 +1,25 @@
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
 use iced::{Color, Element, Length, Subscription, Task, Theme, time};
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::theme::colors;
 
-// ── Raw-byte ring buffer (zero-copy between reader thread and UI) ───────────
+// ── Constants ───────────────────────────────────────────────────────────────
 
-struct RingBuffer {
-    data: Vec<u8>,
-    head: usize,
-    len: usize,
-    cap: usize,
-}
+const ALG: &[&str] = &["MD5","SHA1","SHA256","SHA512","CRC32","BLAKE2B"];
+const MOD: &[(&str, &str)] = &[
+    ("multi-thread", "Multi Thread (默认)"),
+    ("batch-mode",   "Batch Mode"),
+    ("single-thread","Single Thread"),
+];
 
-impl RingBuffer {
-    fn new(cap: usize) -> Self {
-        Self { data: vec![0u8; cap], head: 0, len: 0, cap }
-    }
-
-    fn push(&mut self, chunk: &[u8]) {
-        let n = chunk.len().min(self.cap);
-        if n == 0 { return; }
-        let st = (self.head + self.len) % self.cap;
-        if st + n <= self.cap {
-            self.data[st..st + n].copy_from_slice(&chunk[..n]);
-        } else {
-            let f = self.cap - st;
-            self.data[st..].copy_from_slice(&chunk[..f]);
-            self.data[..n - f].copy_from_slice(&chunk[f..]);
-        }
-        if self.len + n > self.cap {
-            self.head = (self.head + (self.len + n - self.cap)) % self.cap;
-            self.len = self.cap;
-        } else {
-            self.len += n;
-        }
-    }
-
-    /// Drain all buffered bytes, returning owned Vec<u8>.
-    fn drain_all(&mut self) -> Vec<u8> {
-        if self.len == 0 { return Vec::new(); }
-        let st = self.head;
-        let take = self.len;
-        self.len = 0;
-        self.head = 0;
-        let mut out = Vec::with_capacity(take);
-        if st + take <= self.cap {
-            out.extend_from_slice(&self.data[st..st + take]);
-        } else {
-            let f = self.cap - st;
-            out.extend_from_slice(&self.data[st..]);
-            out.extend_from_slice(&self.data[..take - f]);
-        }
-        out
-    }
-
-    fn clear(&mut self) { self.head = 0; self.len = 0; }
-}
+const READ_BUF: usize = 256 * 1024;   // 256 KB per read syscall
+const BATCH_BUF: usize = 128 * 1024;  // 128 KB send batch — smaller = smoother UI
+const MAX_LINES: usize = 6000;         // keep all logs, cap display at last N lines
+const DISPLAY_LINES: usize = 500;      // lines actually rendered in the widget
 
 // ── Message ─────────────────────────────────────────────────────────────────
 
@@ -76,29 +37,18 @@ pub struct App {
     directory: String, algorithm_index: usize, mode_index: usize,
     extensions: String, threads: String, batch_size: String,
     recursive: bool, execute: bool, is_running: bool,
-    ring: RingBuffer,
-    output_text: String,
-    line_count: usize,
+    lines: VecDeque<String>,     // all log lines (O(1) push_back / pop_front)
+    display_cache: String,       // last DISPLAY_LINES joined — only rebuilt when lines change
+    cache_dirty: bool,
     rx: Option<mpsc::Receiver<Vec<u8>>>,
 }
-
-const ALG: &[&str] = &["MD5","SHA1","SHA256","SHA512","CRC32","BLAKE2B"];
-const MOD: &[(&str, &str)] = &[
-    ("multi-thread", "Multi Thread (默认)"),
-    ("batch-mode",   "Batch Mode"),
-    ("single-thread","Single Thread"),
-];
-
-const RING_CAP: usize = 4 * 1024 * 1024; // 4 MB ring
-const MAX_LINES: usize = 4000;            // keep last N lines in view
-const READ_BUF: usize = 256 * 1024;       // 256 KB read buffer (fewer syscalls)
 
 pub fn new() -> (App, Task<Message>) {
     (App {
         directory: String::new(), algorithm_index: 0, mode_index: 0,
         extensions: "jpg,jpeg,png".into(), threads: String::new(), batch_size: String::new(),
         recursive: false, execute: false, is_running: false,
-        ring: RingBuffer::new(RING_CAP), output_text: String::new(), line_count: 0,
+        lines: VecDeque::new(), display_cache: String::new(), cache_dirty: false,
         rx: None,
     }, Task::none())
 }
@@ -128,11 +78,11 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
         Message::Run => {
             if app.is_running || app.directory.is_empty() { return Task::none(); }
             app.is_running = true;
-            app.ring.clear();
-            app.output_text.clear();
-            app.line_count = 0;
-            app.output_text.push_str("Starting...\n");
-            app.line_count += 1;
+            app.lines.clear();
+            app.display_cache.clear();
+            app.cache_dirty = false;
+            app.lines.push_back("Starting...".into());
+            app.cache_dirty = true;
 
             let exe = find_cli_exe();
             let mut args: Vec<String> = Vec::with_capacity(12);
@@ -160,45 +110,67 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
         }
 
         Message::Stop => app.is_running = false,
-        Message::ClearOutput => { app.ring.clear(); app.output_text.clear(); app.line_count = 0; }
+        Message::ClearOutput => {
+            app.lines.clear();
+            app.display_cache.clear();
+            app.cache_dirty = false;
+        }
 
         Message::Tick => {
-            // 1. Bulk-drain ring buffer — one allocation per tick
+            // 1. Drain all pending chunks from channel
+            let mut chunks: Vec<Vec<u8>> = Vec::new();
             if let Some(rx) = &app.rx {
                 loop {
                     match rx.try_recv() {
-                        Ok(chunk) => app.ring.push(&chunk),
+                        Ok(c) => chunks.push(c),
                         Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => { app.is_running = false; break; }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            app.is_running = false;
+                            break;
+                        }
                     }
                 }
             }
 
-            // 2. Extract raw bytes from ring, decode as UTF-8 (lossy), split into lines
-            let raw = app.ring.drain_all();
-            if raw.is_empty() { return Task::none(); }
-
-            let decoded = String::from_utf8_lossy(&raw);
-            for line in decoded.split('\n') {
-                if line.is_empty() { continue; }
-                app.output_text.push_str(line);
-                app.output_text.push('\n');
-                app.line_count += 1;
+            if chunks.is_empty() && !app.cache_dirty {
+                return Task::none();
             }
 
-            // 3. Trim to MAX_LINES — drop oldest complete lines from front
-            while app.line_count > MAX_LINES {
-                if let Some(pos) = app.output_text.find('\n') {
-                    app.output_text.drain(..pos + 1);
-                    app.line_count -= 1;
-                } else { break; }
+            // 2. Decode + split into lines, push to deque — O(n) where n = new bytes
+            for chunk in &chunks {
+                let decoded = String::from_utf8_lossy(chunk);
+                for line in decoded.split('\n') {
+                    if line.is_empty() { continue; }
+                    app.lines.push_back(line.to_string());
+                    app.cache_dirty = true;
+                }
+            }
+
+            // 3. Trim to MAX_LINES — O(1) pop_front per line dropped
+            while app.lines.len() > MAX_LINES {
+                app.lines.pop_front();
+            }
+
+            // 4. Rebuild display cache only when dirty — O(DISPLAY_LINES) not O(total)
+            if app.cache_dirty {
+                let skip = app.lines.len().saturating_sub(DISPLAY_LINES);
+                let tail = app.lines.iter().skip(skip);
+                // Pre-calculate capacity to avoid reallocations
+                let cap: usize = tail.clone().map(|l| l.len() + 1).sum();
+                let mut buf = String::with_capacity(cap);
+                for line in tail {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+                app.display_cache = buf;
+                app.cache_dirty = false;
             }
         }
     }
     Task::none()
 }
 
-// ── Process runner (direct spawn, no bat file) ──────────────────────────────
+// ── Process runner ──────────────────────────────────────────────────────────
 
 fn run_cli_process(exe: &str, args: &[String], tx: &mpsc::Sender<Vec<u8>>) -> Result<(), String> {
     use std::process::{Command, Stdio};
@@ -218,31 +190,43 @@ fn run_cli_process(exe: &str, args: &[String], tx: &mpsc::Sender<Vec<u8>>) -> Re
     let stderr = child.stderr.take().ok_or("No stderr handle")?;
 
     let tx1 = tx.clone();
-    let t1 = std::thread::spawn(move || {
+    std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(BATCH_BUF);
+        let mut buf = [0u8; READ_BUF];
         let mut r = std::io::BufReader::with_capacity(READ_BUF, stdout);
-        let mut buf = vec![0u8; READ_BUF];
         loop {
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { let _ = tx1.send(buf[..n].to_vec()); }
+                Ok(n) => {
+                    batch.extend_from_slice(&buf[..n]);
+                    if batch.len() >= BATCH_BUF {
+                        let _ = tx1.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BUF)));
+                    }
+                }
             }
         }
+        if !batch.is_empty() { let _ = tx1.send(batch); }
     });
 
     let tx2 = tx.clone();
-    let t2 = std::thread::spawn(move || {
+    std::thread::spawn(move || {
+        let mut batch = Vec::with_capacity(BATCH_BUF);
+        let mut buf = [0u8; READ_BUF];
         let mut r = std::io::BufReader::with_capacity(READ_BUF, stderr);
-        let mut buf = vec![0u8; READ_BUF];
         loop {
             match r.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => { let _ = tx2.send(buf[..n].to_vec()); }
+                Ok(n) => {
+                    batch.extend_from_slice(&buf[..n]);
+                    if batch.len() >= BATCH_BUF {
+                        let _ = tx2.send(std::mem::replace(&mut batch, Vec::with_capacity(BATCH_BUF)));
+                    }
+                }
             }
         }
+        if !batch.is_empty() { let _ = tx2.send(batch); }
     });
 
-    let _ = t1.join();
-    let _ = t2.join();
     let _ = child.wait();
     Ok(())
 }
@@ -270,11 +254,11 @@ fn find_cli_exe() -> String {
     "file_renamer.exe".to_string()
 }
 
-// ── Subscription (30 fps tick while running) ────────────────────────────────
+// ── Subscription ────────────────────────────────────────────────────────────
 
 pub fn subscription(app: &App) -> Subscription<Message> {
     if app.is_running {
-        time::every(Duration::from_millis(32)).map(|_| Message::Tick)
+        time::every(Duration::from_millis(16)).map(|_| Message::Tick) // 60 fps
     } else {
         Subscription::none()
     }
@@ -359,11 +343,18 @@ fn view_settings(app: &App) -> Element<'_, Message> {
 }
 
 fn view_output(app: &App) -> Element<'_, Message> {
-    let content = text(&app.output_text).size(13).color(colors::TEXT);
+    // Only render the last DISPLAY_LINES lines — widget never sees the full log
+    let content = text(&app.display_cache).size(13).color(colors::TEXT);
     let scroll = scrollable(content).height(Length::Fill).width(Length::Fill).anchor_bottom();
     let card = container(scroll).padding(16).width(Length::Fill).height(Length::Fill).style(fcard);
+    let total = app.lines.len();
+    let status = if total > 0 {
+        format!("输出 ({} 行)", total)
+    } else {
+        "输出".into()
+    };
     column![
-        row![text("输出").size(16).color(colors::ACCENT)],
+        row![text(status).size(16).color(colors::ACCENT)],
         card
     ].spacing(8).width(Length::Fill).height(Length::Fill).into()
 }
